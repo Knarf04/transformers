@@ -24,6 +24,8 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
+from einops import rearrange
+import functools
 
 import transformers.models.jamba.modeling_jamba as modeling_jamba
 from transformers.activations import ACT2FN
@@ -69,6 +71,7 @@ if is_flash_attn_2_available():
 if is_mamba_2_ssm_available():
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined
+    import mamba_ssm.ops.triton.ssd_combined as ssd_combined
 else:
     selective_state_update = None
 
@@ -203,7 +206,49 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
 
     return hidden_states
 
+def ssd_attn_map(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
+    """
+    Compute the full attention map of the SSD
+    """
+    if dt_bias is not None:
+        dt = dt + dt_bias
+    if dt_softplus:
+        dt = nn.functional.softplus(dt)
+    dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
 
+    A = rearrange(A*dt, "b l h -> b h l")
+    L = torch.exp(segment_sum(A))
+    M = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
+
+    return M
+
+def _ssd_attn_map_decorator(func):
+    @functools.wraps(func)
+    def decorator(*args, **kwargs):
+        M = ssd_attn_map(*args, **kwargs)
+        decorator.ssd_attn_map = M
+        return func(*args, **kwargs)
+    return decorator
+
+def toggle_decorator(output_attentions=False):
+    """
+    Add a handler to store the full attention map of the SSD
+    """
+    func = ssd_combined._mamba_chunk_scan_combined_fwd
+    if output_attentions:
+        if not hasattr(func, '__wrapped__'):
+            ssd_combined._mamba_chunk_scan_combined_fwd = _ssd_attn_map_decorator(func)
+        else:
+            ssd_combined._mamba_chunk_scan_combined_fwd.ssd_attn_map = None
+    elif (not output_attentions) and hasattr(func, '__wrapped__'):
+        ssd_combined._mamba_chunk_scan_combined_fwd = func.__wrapped__
+
+def get_ssd_attn_map():
+    if hasattr(ssd_combined._mamba_chunk_scan_combined_fwd, "ssd_attn_map"):
+        return ssd_combined._mamba_chunk_scan_combined_fwd.ssd_attn_map
+    else: 
+        return None
+    
 # Adapted from transformers.models.mamba2.modeling_mamba2.Mamba2Mixer
 class BambaMixer(nn.Module):
     """
@@ -292,7 +337,10 @@ class BambaMixer(nn.Module):
         cache_params: Optional[HybridMambaAttentionDynamicCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = False,
     ):
+        toggle_decorator(output_attentions)
+
         # 1. Gated MLP's linear projection
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         projected_states = self.in_proj(hidden_states)
@@ -451,7 +499,7 @@ class BambaMixer(nn.Module):
 
                 # 4. Final linear projection
                 out = self.out_proj(scan_output)
-        return out
+        return out, get_ssd_attn_map()
 
     # fmt: off
     def torch_forward(
@@ -460,6 +508,7 @@ class BambaMixer(nn.Module):
         cache_params: Optional[HybridMambaAttentionDynamicCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = False,
     ):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
@@ -580,6 +629,12 @@ class BambaMixer(nn.Module):
             hidden_states = hidden_states.reshape(batch_size, seq_len, -1, self.head_dim).float()
             B = B.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
             C = C.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
+            
+            if output_attentions:
+                A = rearrange(A*dt, "b l h -> b h l")
+                L = torch.exp(segment_sum(A))
+                self_attn_weights = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
+
             B = B.repeat(1, 1, self.num_heads // self.n_groups, 1)
             C = C.repeat(1, 1, self.num_heads // self.n_groups, 1)
             pad_size = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
@@ -658,7 +713,7 @@ class BambaMixer(nn.Module):
 
         # 4. Final linear projection
         contextualized_states = self.out_proj(scan_output.to(dtype))  # [batch, seq_len, hidden_size]
-        return contextualized_states
+        return contextualized_states, self_attn_weights
     # fmt: on
 
     def forward(
@@ -667,15 +722,16 @@ class BambaMixer(nn.Module):
         cache_params: Optional[HybridMambaAttentionDynamicCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = False,
     ):
         if is_fast_path_available and "cuda" in self.in_proj.weight.device.type:
-            return self.cuda_kernels_forward(hidden_states, cache_params, cache_position, attention_mask)
+            return self.cuda_kernels_forward(hidden_states, cache_params, cache_position, attention_mask, output_attentions)
         dtype = hidden_states.dtype
         if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
             # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
             hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
 
-        return self.torch_forward(hidden_states, cache_params, cache_position, attention_mask)
+        return self.torch_forward(hidden_states, cache_params, cache_position, attention_mask, output_attentions)
 
 
 class BambaMLP(LlamaMLP):
@@ -744,13 +800,12 @@ class BambaDecoderLayer(JambaAttentionDecoderLayer):
 
         # this is a hybrid decoder layer
         if self.layer_type == "mamba":
-            hidden_states = self.mamba(
+            hidden_states, self_attn_weights = self.mamba(
                 hidden_states=hidden_states,
                 cache_params=past_key_value,
                 cache_position=cache_position,
                 attention_mask=attention_mask,
             )
-            self_attn_weights = None
         elif self.layer_type == "attention":
             hidden_states, self_attn_weights = self.self_attn(
                 hidden_states=hidden_states,
