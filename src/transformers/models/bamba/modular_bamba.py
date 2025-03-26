@@ -805,6 +805,7 @@ class BambaDecoderLayer(JambaAttentionDecoderLayer):
                 cache_params=past_key_value,
                 cache_position=cache_position,
                 attention_mask=attention_mask,
+                output_attentions=output_attentions,
             )
         elif self.layer_type == "attention":
             hidden_states, self_attn_weights = self.self_attn(
