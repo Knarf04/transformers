@@ -24,7 +24,6 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from einops import rearrange
 import functools
 
 import transformers.models.jamba.modeling_jamba as modeling_jamba
@@ -210,15 +209,16 @@ def ssd_attn_map(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initi
     """
     Compute the full attention map of the SSD
     """
-    if dt_bias is not None:
-        dt = dt + dt_bias
-    if dt_softplus:
-        dt = nn.functional.softplus(dt)
-    dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
+    with torch.no_grad():
+        if dt_bias is not None:
+            dt = dt + dt_bias
+        if dt_softplus:
+            dt = nn.functional.softplus(dt)
+        dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
 
-    A = rearrange(A*dt, "b l h -> b h l")
-    L = torch.exp(segment_sum(A))
-    M = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
+        A = (A*dt).permute([0, 2, 1])
+        L = torch.exp(segment_sum(A))
+        M = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
 
     return M
 
@@ -631,9 +631,9 @@ class BambaMixer(nn.Module):
             C = C.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
             
             if output_attentions:
-                A = rearrange(A*dt, "b l h -> b h l")
-                L = torch.exp(segment_sum(A))
-                self_attn_weights = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
+                with torch.no_grad():
+                    L = torch.exp(segment_sum((A*dt).permute([0, 2, 1])))
+                    self_attn_weights = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
 
             B = B.repeat(1, 1, self.num_heads // self.n_groups, 1)
             C = C.repeat(1, 1, self.num_heads // self.n_groups, 1)

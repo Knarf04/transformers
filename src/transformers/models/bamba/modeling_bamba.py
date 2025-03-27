@@ -60,6 +60,7 @@ if is_mamba_2_ssm_available():
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined
     import mamba_ssm.ops.triton.ssd_combined as ssd_combined
+
 else:
     selective_state_update = None
 
@@ -73,6 +74,9 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "BambaConfig"
 
+DEBUG = True
+SAVE_DIR = '/u/hshen14/log/bamba_logits'
+import os 
 
 # Adapted from transformers.models.jamba.modeling_jamba.HybridMambaAttentionDynamicCache for the v2 mixer
 class HybridMambaAttentionDynamicCache(modeling_jamba.HybridMambaAttentionDynamicCache):
@@ -441,15 +445,16 @@ def ssd_attn_map(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initi
     """
     Compute the full attention map of the SSD
     """
-    if dt_bias is not None:
-        dt = dt + dt_bias
-    if dt_softplus:
-        dt = nn.functional.softplus(dt)
-    dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
+    with torch.no_grad():
+        if dt_bias is not None:
+            dt = dt + dt_bias
+        if dt_softplus:
+            dt = nn.functional.softplus(dt)
+        dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
 
-    A = rearrange(A*dt, "b l h -> b h l")
-    L = torch.exp(segment_sum(A))
-    M = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
+        A = rearrange(A*dt, "b l h -> b h l")
+        L = torch.exp(segment_sum(A))
+        M = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
 
     return M
 
@@ -593,6 +598,8 @@ class BambaMixer(nn.Module):
 
         # getting projected states from cache if it exists
         if use_precomputed_states:
+            if DEBUG:
+                print("Using precomputed states")
             gate, hidden_states_B_C, dt = projected_states.squeeze(1).split(
                 [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
             )
@@ -644,7 +651,7 @@ class BambaMixer(nn.Module):
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
             # 2-4. Fused kernel for conv1d, SSM, and the final projection
-            if self.training and cache_params is None:
+            if self.training and cache_params is None and not DEBUG:
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
@@ -702,6 +709,18 @@ class BambaMixer(nn.Module):
                     [self.intermediate_size, groups_time_state_size, groups_time_state_size],
                     dim=-1,
                 )
+
+                if DEBUG:
+                    curr_state = {}
+                    curr_state['hidden_states'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
+                    curr_state['dt'] = dt
+                    curr_state['A'] = A
+                    curr_state['B'] = B.view(batch_size, seq_len, self.n_groups, -1)
+                    curr_state['C'] = C.view(batch_size, seq_len, self.n_groups, -1)
+                    curr_state['D'] = self.D
+                    curr_state['dt_bias'] = self.dt_bias
+                    print("Saving States...")
+                    torch.save(curr_state, os.path.join(SAVE_DIR, f'curr_state_{seq_len}_{self.layer_idx}.pt'))
 
                 # 3. SSM transformation
                 scan_output, ssm_state = mamba_chunk_scan_combined(
@@ -862,9 +881,9 @@ class BambaMixer(nn.Module):
             C = C.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
             
             if output_attentions:
-                A = rearrange(A*dt, "b l h -> b h l")
-                L = torch.exp(segment_sum(A))
-                self_attn_weights = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
+                with torch.no_grad():
+                    L = torch.exp(segment_sum((A*dt).permute([0, 2, 1])))
+                    self_attn_weights = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
 
             B = B.repeat(1, 1, self.num_heads // self.n_groups, 1)
             C = C.repeat(1, 1, self.num_heads // self.n_groups, 1)
