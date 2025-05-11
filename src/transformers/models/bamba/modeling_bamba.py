@@ -28,8 +28,9 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from einops import rearrange
 import functools
+import json
+import numpy as np
 
 import transformers.models.jamba.modeling_jamba as modeling_jamba
 from transformers.activations import ACT2FN
@@ -74,9 +75,11 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "BambaConfig"
 
-DEBUG = True
-SAVE_DIR = '/u/hshen14/log/bamba_logits'
+DEBUG = False
+SAVE_DIR = '/work/nvme/bcjw/hshen14/datasets/phonebook/logits'
+LOG_DIR = '/u/hshen14/LongBamba/experiments/log.jsonl'
 import os 
+import torch.nn.functional as F
 
 # Adapted from transformers.models.jamba.modeling_jamba.HybridMambaAttentionDynamicCache for the v2 mixer
 class HybridMambaAttentionDynamicCache(modeling_jamba.HybridMambaAttentionDynamicCache):
@@ -340,7 +343,41 @@ class BambaAttention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attention_interface(
+        if DEBUG:
+            curr_state = {}
+            curr_state['q'] = query_states
+            curr_state['k'] = key_states
+            curr_state['v'] = value_states
+            curr_state['mask'] = attention_mask
+            curr_state['scaling'] = self.scaling
+            mmd = mmd_from_gqa_inputs(query_states, key_states, attention_mask=attention_mask, scaling=self.scaling)
+            record = {
+                "layer_idx": self.layer_idx,
+                "seq_len": query_states.shape[2],
+                "erf": mmd.tolist()
+                }
+            with open(LOG_DIR, 'a') as f:
+                f.write(json.dumps(record) + '\n')
+
+            # print("Saving States...")
+            # torch.save(curr_state, os.path.join(SAVE_DIR, f'curr_state_{seq_len}_{self.layer_idx}.pt'))
+
+        attn_weights = None
+        if kwargs['output_attentions']:
+            # GQA with group=4
+            print("Saving attention map")
+            with torch.no_grad():
+                B, H_q, L, d = query_states.shape
+                H_k = key_states.shape[1]
+                group_size = H_q // H_k
+                query_grouped = query_states.view(B, H_k, group_size, L, d)
+                key_expanded_t = key_states.unsqueeze(2).transpose(-1, -2)
+                scores_scaled = torch.einsum("bghid, bghdj -> bghij", query_grouped, key_expanded_t) * self.scaling
+                attn_map_grouped = nn.functional.softmax(scores_scaled, dim=-1)
+                attn_weights = attn_map_grouped.view(B, H_q, L, L)
+
+                # attn_weights = nn.functional.softmax()
+        attn_output, _ = attention_interface(
             self,
             query_states,
             key_states,
@@ -441,7 +478,7 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
 
     return hidden_states
 
-def ssd_attn_map(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
+def ssd_attn_map(dt, A, B, C, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
     """
     Compute the full attention map of the SSD
     """
@@ -452,7 +489,7 @@ def ssd_attn_map(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initi
             dt = nn.functional.softplus(dt)
         dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
 
-        A = rearrange(A*dt, "b l h -> b h l")
+        A = (A*dt).permute([0, 2, 1])
         L = torch.exp(segment_sum(A))
         M = torch.einsum("blhn, bshn, bhls, bsh -> blhs", C, B, L, dt)    # Full Attention Map of Mamba2
 
@@ -461,7 +498,7 @@ def ssd_attn_map(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initi
 def _ssd_attn_map_decorator(func):
     @functools.wraps(func)
     def decorator(*args, **kwargs):
-        M = ssd_attn_map(*args, **kwargs)
+        M = ssd_attn_map(args[1], args[2], args[3], args[4], kwargs['dt_bias'], kwargs['dt_softplus'], kwargs['dt_limit'])
         decorator.ssd_attn_map = M
         return func(*args, **kwargs)
     return decorator
@@ -484,7 +521,99 @@ def get_ssd_attn_map():
         return ssd_combined._mamba_chunk_scan_combined_fwd.ssd_attn_map
     else: 
         return None
+
+#
+def inplace_scale(scale: float,
+                  wx: torch.Tensor,
+                  b: torch.Tensor) -> torch.Tensor:
+    if scale >= 1:
+        return 1 # don't change the scale if the context length is well trained. 
+    t = scale * F.softplus(wx + b)
+    y = torch.expm1(t).clamp_min(1e-6) 
+    return (torch.log(y) - b) / wx
+
+def mmd_from_gqa_inputs(query_states, key_states, attention_mask=None, scaling=1.0):
+    with torch.no_grad():
+        B, H_q, L, d = query_states.shape
+        H_k = key_states.shape[1]
+        group_size = H_q // H_k
+
+        q_last = query_states.view(B, H_k, group_size, L, d)[..., -1, :]
+        k = key_states.transpose(-2, -1).unsqueeze(2)
+        k = k.expand(-1, -1, group_size, -1, -1)
+
+        scores = torch.einsum("bghd,bghdj->bghj", q_last, k) * scaling
+
+        if attention_mask is not None:
+            m = attention_mask.to(query_states.dtype).unsqueeze(1).unsqueeze(2)
+            scores = scores.masked_fill(m == 0, float("-inf"))
+
+        attn_avg = F.softmax(scores, dim=-1).view(B, H_q, L).mean(dim=0)
+
+        dist = torch.arange(L - 1, -1, -1, dtype=attn_avg.dtype, device=attn_avg.device)
+        aw = torch.abs(attn_avg)
+        aw = aw / aw.sum(dim=-1, keepdim=True)
+        mmd = (aw * dist).sum(dim=-1)
+
+    return mmd
+
+def mmd_from_gqa_inputs(query_states, key_states, attention_mask=None, scaling=1.0):
+    with torch.no_grad():
+        B, H_q, L, d = query_states.shape
+        H_k = key_states.shape[1]
+        group_size = H_q // H_k
+
+        q_last = query_states.view(B, H_k, group_size, L, d)[..., -1, :]
+        k = key_states.transpose(-2, -1).unsqueeze(2)
+        k = k.expand(-1, -1, group_size, -1, -1)
+
+        scores = torch.einsum("bghd,bghdj->bghj", q_last, k) * scaling
+
+        if attention_mask is not None:
+            m = attention_mask.to(query_states.dtype).unsqueeze(1).unsqueeze(2)
+            scores = scores.masked_fill(m == 0, float("-inf"))
+
+        attn = F.softmax(scores, dim=-1).view(B, H_q, L)
+        attn_avg = attn.mean(dim=0)
+        dist = torch.arange(L - 1, -1, -1, dtype=attn_avg.dtype, device=attn_avg.device)  # (L,)
+        aw = attn_avg.abs()                                 # (H_q, L)
+        aw = aw / aw.sum(dim=-1, keepdim=True)              # normalize over L
+        mmd = (aw * dist).sum(dim=-1)
+
+    return mmd
     
+def mmd_from_ssd_inputs(dt, A, B, C, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
+    with torch.no_grad():
+        if dt_bias is not None:
+            dt = dt + dt_bias
+        if dt_softplus:
+            dt = F.softplus(dt)
+        if dt_limit is not None:
+            dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
+
+        A_dt = (A * dt).permute(0, 2, 1)    # (B, H, S)
+
+        rev = A_dt.flip(dims=(-1,))        # (B, H, S)
+        rev_cumsum = torch.cumsum(rev, dim=-1)  # (B, H, S),
+        zeros = torch.zeros_like(rev_cumsum[..., :1])
+        rev_cumsum_excl = torch.cat([zeros, rev_cumsum[..., :-1]], dim=-1)
+        tail_sum = rev_cumsum_excl.flip(dims=(-1,))  # (B, H, S)
+        L_last = torch.exp(tail_sum)       # (B, H, S)
+
+        C_last = C[:, -1, :, :]                        # (B, H, N)
+        Q = torch.einsum("bhn,bshn->bhs", C_last, B)
+        dt_hks = dt.permute(0, 2, 1)                    # (B, H, S)
+
+        raw = Q * L_last * dt_hks                       # (B, H, S)
+        aw  = raw.abs()
+        aw  = aw / aw.sum(dim=-1, keepdim=True)        # normalize over S
+        S = aw.size(-1)
+        dist = torch.arange(S-1, -1, -1, dtype=aw.dtype, device=aw.device)
+
+        mmd = torch.einsum("s,bhs->bh", dist, aw)
+
+    return mmd
+
 # Adapted from transformers.models.mamba2.modeling_mamba2.Mamba2Mixer
 class BambaMixer(nn.Module):
     """
@@ -558,6 +687,17 @@ class BambaMixer(nn.Module):
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=self.use_bias)
 
+        # load head mask for scaling
+        data = {}
+        with open("/u/hshen14/LongBamba/experiments/config/head90.jsonl", "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)  
+                data.update(obj)
+        self.head_mask = torch.tensor(data[f"{self.layer_idx}"], dtype=torch.bool)
+
         if not is_fast_path_available:
             logger.warning_once(
                 "The fast path is not available because on of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
@@ -624,6 +764,14 @@ class BambaMixer(nn.Module):
             A = A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+
+            # A = A.clone()
+            # A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+            # # dt = dt.clone()
+            # # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
+            # B = B.clone()
+            # B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+
             D = self.D[:, None, ...].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
             C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
@@ -650,8 +798,10 @@ class BambaMixer(nn.Module):
             A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
+            self.seq_len = seq_len # store seq_len for later scaling
             # 2-4. Fused kernel for conv1d, SSM, and the final projection
             if self.training and cache_params is None and not DEBUG:
+                print("Warning: scaling not implemented!")
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
@@ -719,8 +869,31 @@ class BambaMixer(nn.Module):
                     curr_state['C'] = C.view(batch_size, seq_len, self.n_groups, -1)
                     curr_state['D'] = self.D
                     curr_state['dt_bias'] = self.dt_bias
-                    print("Saving States...")
-                    torch.save(curr_state, os.path.join(SAVE_DIR, f'curr_state_{seq_len}_{self.layer_idx}.pt'))
+                    mmd = mmd_from_ssd_inputs(dt, A, curr_state['B'], curr_state['C'], dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
+
+                    record = {
+                        "layer_idx": self.layer_idx,
+                        "seq_len": self.seq_len,
+                        "erf": mmd.tolist()
+                        }
+                    with open(LOG_DIR, 'a') as f:
+                        f.write(json.dumps(record) + '\n')
+                    # torch.save(curr_state, os.path.join(SAVE_DIR, f'curr_state_{seq_len}_{self.layer_idx}.pt'))
+                    # print(f"{self.layer_idx} {seq_len} {}")
+
+                # if self.layer_idx in [3, 6, 12, 14, 16, 19, 22]:
+                #     A = A.clone()
+                #     A *= 4096/self.seq_len
+                #     # dt = dt.clone()
+                #     # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
+                #     B = B.clone()
+                #     B *= 4096/self.seq_len
+                # A = A.clone()
+                # A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+                # # dt = dt.clone()
+                # # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
+                # B = B.clone()
+                # B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
 
                 # 3. SSM transformation
                 scan_output, ssm_state = mamba_chunk_scan_combined(
