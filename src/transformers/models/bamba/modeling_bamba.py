@@ -987,7 +987,24 @@ class BambaMixer(nn.Module):
         )
 
         # 3. SSM transformation
-        A = -torch.exp(self.A_log.float())                            # [num_heads]
+        A = -torch.exp(self.A_log.float()) 
+        
+        # Layer scale
+        # if self.layer_idx in [3, 6, 12, 14, 16, 19, 22]:
+        #     A = A.clone()
+        #     A *= 4096/self.seq_len
+        #     # dt = dt.clone()
+        #     # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
+        #     B = B.clone()
+        #     B *= 4096/self.seq_len
+        # Head scale
+        A = A.clone()
+        A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+        B = B.clone()
+        B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+        # dt = dt.clone()
+        # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
+
         if use_precomputed_states:
             # We need to guarantee that anything regarding the cache is on the same device
             cache_device = cache_params.ssm_states[self.layer_idx].device
