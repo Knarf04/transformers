@@ -64,7 +64,10 @@ logger = logging.get_logger(__name__)
 
 
 _CONFIG_FOR_DOC = "Zyphra/Zamba2-2.7B"
-
+DEBUG = True
+SAVE_DIR = '/work/nvme/bcjw/hshen14/datasets/phonebook/logits'
+LOG_DIR = '/u/hshen14/LongBamba/experiments/zamba2_log.jsonl'
+import json
 
 class Zamba2RMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, group_size, eps=1e-6):
@@ -353,6 +356,30 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+def mmd_from_gqa_inputs(query_states, key_states, attention_mask=None, scaling=1.0):
+    with torch.no_grad():
+        B, H_q, L, d = query_states.shape
+        H_k = key_states.shape[1]
+        group_size = H_q // H_k
+
+        q_last = query_states.view(B, H_k, group_size, L, d)[..., -1, :]
+        k = key_states.transpose(-2, -1).unsqueeze(2)
+        k = k.expand(-1, -1, group_size, -1, -1)
+
+        scores = torch.einsum("bghd,bghdj->bghj", q_last, k) * scaling
+
+        if attention_mask is not None:
+            m = attention_mask.to(query_states.dtype).unsqueeze(1).unsqueeze(2)
+            scores = scores.masked_fill(m == 0, float("-inf"))
+
+        attn_avg = F.softmax(scores, dim=-1).view(B, H_q, L).mean(dim=0)
+
+        dist = torch.arange(L - 1, -1, -1, dtype=attn_avg.dtype, device=attn_avg.device)
+        aw = torch.abs(attn_avg)
+        aw = aw / aw.sum(dim=-1, keepdim=True)
+        mmd = (aw * dist).sum(dim=-1)
+
+    return mmd
 
 class Zamba2Attention(nn.Module):
     """
@@ -479,6 +506,22 @@ class Zamba2Attention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        if DEBUG:
+            curr_state = {}
+            curr_state['q'] = query_states
+            curr_state['k'] = key_states
+            curr_state['v'] = value_states
+            curr_state['mask'] = attention_mask
+            curr_state['scaling'] = self.scaling
+            mmd = mmd_from_gqa_inputs(query_states, key_states, attention_mask=attention_mask, scaling=self.scaling)
+            record = {
+                "layer_idx": self.layer_idx,
+                "seq_len": query_states.shape[2],
+                "erf": mmd.tolist()
+                }
+            with open(LOG_DIR, 'a') as f:
+                f.write(json.dumps(record) + '\n')
+
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -551,6 +594,37 @@ def segment_sum(input_tensor):
 
 is_fast_path_available = all((selective_state_update, causal_conv1d_fn, causal_conv1d_update))
 
+def mmd_from_ssd_inputs(dt, A, B, C, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
+    with torch.no_grad():
+        if dt_bias is not None:
+            dt = dt + dt_bias
+        if dt_softplus:
+            dt = F.softplus(dt)
+        if dt_limit is not None:
+            dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
+
+        A_dt = (A * dt).permute(0, 2, 1)    # (B, H, S)
+
+        rev = A_dt.flip(dims=(-1,))        # (B, H, S)
+        rev_cumsum = torch.cumsum(rev, dim=-1)  # (B, H, S),
+        zeros = torch.zeros_like(rev_cumsum[..., :1])
+        rev_cumsum_excl = torch.cat([zeros, rev_cumsum[..., :-1]], dim=-1)
+        tail_sum = rev_cumsum_excl.flip(dims=(-1,))  # (B, H, S)
+        L_last = torch.exp(tail_sum)       # (B, H, S)
+
+        C_last = C[:, -1, :, :]                        # (B, H, N)
+        Q = torch.einsum("bhn,bshn->bhs", C_last, B)
+        dt_hks = dt.permute(0, 2, 1)                    # (B, H, S)
+
+        raw = Q * L_last * dt_hks                       # (B, H, S)
+        aw  = raw.abs()
+        aw  = aw / aw.sum(dim=-1, keepdim=True)        # normalize over S
+        S = aw.size(-1)
+        dist = torch.arange(S-1, -1, -1, dtype=aw.dtype, device=aw.device)
+
+        mmd = torch.einsum("s,bhs->bh", dist, aw)
+
+    return mmd
 
 class Zamba2MambaMixer(nn.Module):
     """
@@ -618,6 +692,17 @@ class Zamba2MambaMixer(nn.Module):
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.add_bias_linear)
 
+                # load head mask for scaling
+        data = {}
+        with open("/u/hshen14/LongBamba/experiments/config/head_zamba.jsonl", "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)  
+                data.update(obj)
+        self.head_mask = torch.tensor(data[f"{self.layer_idx}"], dtype=torch.bool)
+
         if not is_fast_path_available:
             logger.warning_once(
                 "The fast path is not available because on of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
@@ -666,6 +751,38 @@ class Zamba2MambaMixer(nn.Module):
             B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
             C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
             hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
+            
+            if DEBUG:
+                curr_state = {}
+                curr_state['hidden_states'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
+                curr_state['dt'] = dt
+                curr_state['A'] = A
+                curr_state['B'] = B.view(batch_size, seq_len, self.n_groups, -1)
+                curr_state['C'] = C.view(batch_size, seq_len, self.n_groups, -1)
+                curr_state['D'] = self.D
+                curr_state['dt_bias'] = self.dt_bias
+                mmd = mmd_from_ssd_inputs(dt, A, curr_state['B'], curr_state['C'], dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
+
+                record = {
+                    "layer_idx": self.layer_idx,
+                    "seq_len": self.seq_len,
+                    "erf": mmd.tolist()
+                    }
+                with open(LOG_DIR, 'a') as f:
+                    f.write(json.dumps(record) + '\n')
+            # Layer scale
+            # if self.layer_idx in [3, 6, 12, 14, 16, 19, 22]:
+            #     A = A.clone()
+            #     A *= 4096/self.seq_len
+            #     # dt = dt.clone()
+            #     # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
+            #     B = B.clone()
+            #     B *= 4096/self.seq_len
+            # Head scale
+            # A = A.clone()
+            # A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+            # B = B.clone()
+            # B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
             hidden_states = selective_state_update(
                 cache_params.ssm_states[self.layer_idx],
                 hidden_states_reshaped,
@@ -752,6 +869,21 @@ class Zamba2MambaMixer(nn.Module):
                     # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
                     dtype = hidden_states.dtype
                     hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+                
+                # Layer scale
+                # if self.layer_idx in [3, 6, 12, 14, 16, 19, 22]:
+                #     A = A.clone()
+                #     A *= 4096/self.seq_len
+                #     # dt = dt.clone()
+                #     # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
+                #     B = B.clone()
+                #     B *= 4096/self.seq_len
+                # Head scale
+                A = A.clone()
+                A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+                B = B.clone()
+                B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+
                 scan_output, ssm_state = mamba_chunk_scan_combined(
                     hidden_states.view(batch_size, seq_len, -1, self.head_dim),
                     time_step,
@@ -827,6 +959,40 @@ class Zamba2MambaMixer(nn.Module):
             hidden_states = self.act(self.conv1d(hidden_states.transpose(1, 2))[..., :seq_len].transpose(1, 2))
         hidden_states, B, C = torch.split(hidden_states, [self.intermediate_size, self.n_groups * self.ssm_state_size, self.n_groups * self.ssm_state_size], dim=-1)
         A = -torch.exp(self.A_log.float())                            # [num_heads]
+
+        if DEBUG:
+            curr_state = {}
+            curr_state['hidden_states'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
+            curr_state['dt'] = dt
+            curr_state['A'] = A
+            curr_state['B'] = B.view(batch_size, seq_len, self.n_groups, -1)
+            curr_state['C'] = C.view(batch_size, seq_len, self.n_groups, -1)
+            curr_state['D'] = self.D
+            curr_state['dt_bias'] = self.dt_bias
+            mmd = mmd_from_ssd_inputs(dt, A, curr_state['B'], curr_state['C'], dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
+
+            record = {
+                "layer_idx": self.layer_idx,
+                "seq_len": self.seq_len,
+                "erf": mmd.tolist()
+                }
+            with open(LOG_DIR, 'a') as f:
+                f.write(json.dumps(record) + '\n')
+
+        # Layer scale
+        # if self.layer_idx in [3, 6, 12, 14, 16, 19, 22]:
+        #     A = A.clone()
+        #     A *= 4096/self.seq_len
+        #     # dt = dt.clone()
+        #     # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
+        #     B = B.clone()
+        #     B *= 4096/self.seq_len
+        # Head scale
+        # A = A.clone()
+        # A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+        # B = B.clone()
+        # B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+
         if cache_params is not None and cache_params.has_previous_state:
             # Note: there is no need to pad parameter matrices here, as there is just one new token
             # for batched generation

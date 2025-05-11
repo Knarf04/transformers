@@ -557,30 +557,6 @@ def mmd_from_gqa_inputs(query_states, key_states, attention_mask=None, scaling=1
 
     return mmd
 
-def mmd_from_gqa_inputs(query_states, key_states, attention_mask=None, scaling=1.0):
-    with torch.no_grad():
-        B, H_q, L, d = query_states.shape
-        H_k = key_states.shape[1]
-        group_size = H_q // H_k
-
-        q_last = query_states.view(B, H_k, group_size, L, d)[..., -1, :]
-        k = key_states.transpose(-2, -1).unsqueeze(2)
-        k = k.expand(-1, -1, group_size, -1, -1)
-
-        scores = torch.einsum("bghd,bghdj->bghj", q_last, k) * scaling
-
-        if attention_mask is not None:
-            m = attention_mask.to(query_states.dtype).unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(m == 0, float("-inf"))
-
-        attn = F.softmax(scores, dim=-1).view(B, H_q, L)
-        attn_avg = attn.mean(dim=0)
-        dist = torch.arange(L - 1, -1, -1, dtype=attn_avg.dtype, device=attn_avg.device)  # (L,)
-        aw = attn_avg.abs()                                 # (H_q, L)
-        aw = aw / aw.sum(dim=-1, keepdim=True)              # normalize over L
-        mmd = (aw * dist).sum(dim=-1)
-
-    return mmd
     
 def mmd_from_ssd_inputs(dt, A, B, C, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
     with torch.no_grad():
