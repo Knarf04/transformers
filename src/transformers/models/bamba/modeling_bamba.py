@@ -75,11 +75,19 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "BambaConfig"
 
-DEBUG = False
+LONGMAMBA = False
+HEADWISE = False
+LAYERWISE = False
+ERF = False
 SAVE_DIR = '/work/nvme/bcjw/hshen14/datasets/phonebook/logits'
 LOG_DIR = '/u/hshen14/LongBamba/experiments/log.jsonl'
+LONGMAMBA_LOG_DIR = ''
 import os 
 import torch.nn.functional as F
+from einops import rearrange
+
+if LONGMAMBA:
+    from LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
 
 # Adapted from transformers.models.jamba.modeling_jamba.HybridMambaAttentionDynamicCache for the v2 mixer
 class HybridMambaAttentionDynamicCache(modeling_jamba.HybridMambaAttentionDynamicCache):
@@ -343,7 +351,7 @@ class BambaAttention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        if DEBUG:
+        if ERF:
             curr_state = {}
             curr_state['q'] = query_states
             curr_state['k'] = key_states
@@ -664,15 +672,16 @@ class BambaMixer(nn.Module):
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=self.use_bias)
 
         # load head mask for scaling
-        data = {}
-        with open("/u/hshen14/LongBamba/experiments/config/head90.jsonl", "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)  
-                data.update(obj)
-        self.head_mask = torch.tensor(data[f"{self.layer_idx}"], dtype=torch.bool)
+        if HEADWISE:
+            data = {}
+            with open("/u/hshen14/LongBamba/experiments/config/head90.jsonl", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)  
+                    data.update(obj)
+            self.head_mask = torch.tensor(data[f"{self.layer_idx}"], dtype=torch.bool)
 
         if not is_fast_path_available:
             logger.warning_once(
@@ -714,8 +723,6 @@ class BambaMixer(nn.Module):
 
         # getting projected states from cache if it exists
         if use_precomputed_states:
-            if DEBUG:
-                print("Using precomputed states")
             gate, hidden_states_B_C, dt = projected_states.squeeze(1).split(
                 [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
             )
@@ -776,8 +783,10 @@ class BambaMixer(nn.Module):
 
             self.seq_len = seq_len # store seq_len for later scaling
             # 2-4. Fused kernel for conv1d, SSM, and the final projection
-            if self.training and cache_params is None and not DEBUG:
+            if self.training and cache_params is None:
                 print("Warning: scaling not implemented!")
+                if LONGMAMBA:
+                    assert False, "no fast path for longmamba yet"
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
@@ -836,7 +845,7 @@ class BambaMixer(nn.Module):
                     dim=-1,
                 )
 
-                if DEBUG:
+                if ERF:
                     curr_state = {}
                     curr_state['hidden_states'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
                     curr_state['dt'] = dt
@@ -857,19 +866,98 @@ class BambaMixer(nn.Module):
                     # torch.save(curr_state, os.path.join(SAVE_DIR, f'curr_state_{seq_len}_{self.layer_idx}.pt'))
                     # print(f"{self.layer_idx} {seq_len} {}")
 
-                # if self.layer_idx in [3, 6, 12, 14, 16, 19, 22]:
-                #     A = A.clone()
-                #     A *= 4096/self.seq_len
-                #     # dt = dt.clone()
-                #     # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
-                #     B = B.clone()
-                #     B *= 4096/self.seq_len
-                # A = A.clone()
-                # A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
-                # # dt = dt.clone()
-                # # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
-                # B = B.clone()
-                # B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+                if LAYERWISE:
+                    if self.layer_idx in [3, 6, 12, 14, 16, 19, 22]:
+                        A = A.clone()
+                        A *= 4096/self.seq_len
+                        B = B.clone()
+                        B *= 4096/self.seq_len
+
+                if HEADWISE:
+                    A = A.clone()
+                    A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+                    B = B.clone()
+                    B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+
+                dt_bias = self.dt_bias
+                dt_softplus = True
+
+                if LONGMAMBA:
+                    # dt alignment
+                    params_for_debug = {}
+                    dt = F.softplus(dt + self.dt_bias)
+                    if merge_config is not None and merge_config['model_arch'] == "ours" and int(self.seq_len/1e3) > 2:
+                        channel_threshold = merge_config['c']
+                        tA_prod_path = f"./artifacts/{merge_config['align_path']}/tA_prod/tA_prod_layer_{self.layer_idx}.pt"
+                        alpha_path = f"./artifacts/{merge_config['align_path']}/alpha/alpha_layer_{self.layer_idx}.pt"
+                        decay_path = f"./artifacts/{merge_config['align_path']}/decay/decay_layer_{self.layer_idx}.pt"
+                        dt_thre_path = f"./artifacts/{merge_config['align_path']}/delta_t-thre/delta_t-thre_layer_{self.layer_idx}.pt"
+                        tA_prod = torch.load(tA_prod_path, map_location=dt.device)
+                        self.channel_mask = tA_prod > channel_threshold
+                        whether_mask = self.channel_mask.sum() != 0
+                        available_values = []
+                        if merge_config['our_method'] in ["alpha", "offline"]:
+                            alpha_all = torch.load(alpha_path, map_location=dt.device)
+                            for k in alpha_all:
+                                available_values.append(int(k[:-1])*1e3)
+                        elif merge_config['our_method'] in ["bound", "norm"]:  
+                            decay = torch.load(decay_path, map_location=dt.device)
+                        elif merge_config['our_method'] in ["dt_thre"]:
+                            dt_thre_all = torch.load(dt_thre_path, map_location=dt.device)
+                            for k in dt_thre_all:
+                                available_values.append(int(k[:-1])*1e3)
+                            
+                        self.slow_factor = 0
+                        self.topk = 2000
+                        dt = rearrange(dt, "b l h -> b h l")
+                        if merge_config['our_method'] == "channelwise_topk" and whether_mask:
+                            topk_mask = get_topk_mask_channelwise(delta_t=dt[:, self.channel_mask], k=self.topk)
+                            dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                        elif merge_config['our_method'] == "all_topk" and whether_mask:
+                            topk_indice = get_top_k_token_indices(dt[:, self.channel_mask], k=self.topk)
+                            topk_mask = torch.zeros_like(dt[:, self.channel_mask], dtype=torch.bool)
+                            topk_mask[:,:,topk_indice] = True
+                            dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                        elif whether_mask and merge_config['b'] != 0:
+                            key_num = int(min(available_values, key=lambda x: abs(self.seqlen - x))/1e3) if available_values != [] else None
+                            if "alpha" in merge_config['our_method']:
+                                channel_alpha = alpha_all[f"{key_num}k"].to(dt.device)
+                                topk_mask = get_channelwise_topAlpha(delta_t=dt[:, self.channel_mask], alpha=channel_alpha[self.channel_mask]*merge_config['b'])
+                                dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                            elif "offline" in merge_config['our_method']:
+                                key_num_offline = int(min(available_values, key=lambda x: abs(self.seqlen - x))/1e3)
+                                channel_alpha = alpha_all[f"{key_num_offline}k"].to(dt.device)
+                                topk_mask, _ = get_channelwise_offline(delta_t=dt[:, self.channel_mask], alpha=channel_alpha[self.channel_mask]*merge_config['b'])
+                                dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                            elif "bound" in merge_config['our_method']:
+                                topk_mask = get_channelwise_topBound(delta_t=dt[:, self.channel_mask], decay=decay[self.channel_mask]*merge_config['b'])
+                                dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                            elif "norm" in merge_config['our_method']:
+                                dt_norm = get_channelwise_normalize(delta_t=dt[:, self.channel_mask], decay=decay[self.channel_mask]*merge_config['b'])
+                                dt[:, self.channel_mask] = dt_norm
+                            elif "dt_thre" in merge_config['our_method']:
+                                channel_dt_thre_all = dt_thre_all[f"{key_num}k"].to(dt.device)
+                                # self.dt_thre[f"layer_{self.layer_idx}"] = channel_dt_thre_all
+                                topk_mask = get_channelwise_dt_threshold(delta_t=dt[:, self.channel_mask], dt_thre=channel_dt_thre_all[self.channel_mask]*merge_config['b'])
+                                dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                        else:
+                            if whether_mask:
+                                print("Warning: no method is applied")
+                            dt[:, self.channel_mask] = dt[:, self.channel_mask] * 0
+                        dt = rearrange(dt, "b h l -> b l h")
+                    if merge_config['save_para4debug']:
+                        params_for_debug['A'] = A.clone().cpu()
+                        params_for_debug['Sb_x'] = B.clone().cpu()  # B before discretization
+                        params_for_debug['C'] = C.clone().cpu()
+                        params_for_debug['delta_t'] = dt.clone().cpu()
+                        print("Save parameters mamba2 debug")
+                        params_for_debug['B_t'] = None
+                    
+                    dt_bias = None
+                    dt_softplus = False
+                    # Change params_for_debug from outputing to saving to log file
+                    with open(LONGMAMBA_LOG_DIR, 'a') as f:
+                        f.write(json.dumps(params_for_debug) + '\n')
 
                 # 3. SSM transformation
                 scan_output, ssm_state = mamba_chunk_scan_combined(
@@ -883,8 +971,8 @@ class BambaMixer(nn.Module):
                     z=None,
                     seq_idx=None,
                     return_final_states=True,
-                    dt_bias=self.dt_bias,
-                    dt_softplus=True,
+                    dt_bias=dt_bias,
+                    dt_softplus=dt_softplus,
                     **dt_limit_kwargs,
                 )
 

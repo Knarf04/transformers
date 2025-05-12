@@ -693,15 +693,15 @@ class Zamba2MambaMixer(nn.Module):
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.add_bias_linear)
 
                 # load head mask for scaling
-        data = {}
-        with open("/u/hshen14/LongBamba/experiments/config/head_zamba.jsonl", "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)  
-                data.update(obj)
-        self.head_mask = torch.tensor(data[f"{self.layer_idx}"], dtype=torch.bool)
+        # data = {}
+        # with open("/u/hshen14/LongBamba/experiments/config/head_zamba.jsonl", "r") as f:
+        #     for line in f:
+        #         line = line.strip()
+        #         if not line:
+        #             continue
+        #         obj = json.loads(line)  
+        #         data.update(obj)
+        # self.head_mask = torch.tensor(data[f"{self.layer_idx}"], dtype=torch.bool)
 
         if not is_fast_path_available:
             logger.warning_once(
@@ -879,10 +879,10 @@ class Zamba2MambaMixer(nn.Module):
                 #     B = B.clone()
                 #     B *= 4096/self.seq_len
                 # Head scale
-                A = A.clone()
-                A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
-                B = B.clone()
-                B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+                # A = A.clone()
+                # A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+                # B = B.clone()
+                # B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
 
                 scan_output, ssm_state = mamba_chunk_scan_combined(
                     hidden_states.view(batch_size, seq_len, -1, self.head_dim),
