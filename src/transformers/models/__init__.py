@@ -190,6 +190,7 @@ from . import (
     mvp,
     myt5,
     nemotron,
+    nemotron_h,
     nllb,
     nllb_moe,
     nougat,
