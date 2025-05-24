@@ -17,8 +17,8 @@
 
 import re
 
-from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
+from ...configuration_utils import PretrainedConfig
+from ...utils import logging
 
 
 logger = logging.get_logger(__name__)
@@ -241,3 +241,5 @@ class NemotronHConfig(PretrainedConfig):
             "mamba" if self.hybrid_override_pattern[i] == "M" else
             "attention" if self.hybrid_override_pattern[i] == "*" else "mlp"
             for i in range(self.num_hidden_layers)]
+
+__all__ = ["NemotronHConfig"]
