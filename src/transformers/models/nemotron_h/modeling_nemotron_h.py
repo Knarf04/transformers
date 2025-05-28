@@ -1110,6 +1110,7 @@ class NemotronHPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["NemotronHBlock"]
     supports_gradient_checkpointing = True
     _is_stateful = True
+    _supports_flash_attn_2 = True
 
     def _init_weights(self, module):
         """Initialize the weights."""
