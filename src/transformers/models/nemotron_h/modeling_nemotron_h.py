@@ -1630,7 +1630,7 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
             attentions=nemotron_h_outputs.attentions,
         )
 
-_all__ = [
+__all__ = [
     "NemotronHForCausalLM",
     "NemotronHModel",
     "NemotronHPreTrainedModel",
