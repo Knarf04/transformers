@@ -76,8 +76,8 @@ _CONFIG_FOR_DOC = "BambaConfig"
 import os
 from einops import rearrange
 
-from .LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
-from .bamba_utils import mmd_from_gqa_inputs, mmd_from_ssd_inputs
+from ...analysis.LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
+from ...analysis.mmd import mmd_from_gqa_inputs, mmd_from_ssd_inputs
 
 # Adapted from transformers.models.jamba.modeling_jamba.HybridMambaAttentionDynamicCache for the v2 mixer
 class HybridMambaAttentionDynamicCache(modeling_jamba.HybridMambaAttentionDynamicCache):
@@ -309,6 +309,9 @@ class BambaAttention(nn.Module):
         
         self.exp_type = getattr(config, "exp_type", {}) 
 
+        if "context_length" not in self.exp_type.keys():
+            self.exp_type["context_length"] = 4096
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -362,22 +365,7 @@ class BambaAttention(nn.Module):
             curr_state['scaling'] = self.scaling
             torch.save(curr_state, os.path.join(self.exp_type["logits"], f'curr_state_{query_states.shape[2]}_{self.layer_idx}.pt'))
 
-        attn_weights = None
-        if kwargs['output_attentions']:
-            # GQA with group=4
-            print("Saving attention map")
-            with torch.no_grad():
-                B, H_q, L, d = query_states.shape
-                H_k = key_states.shape[1]
-                group_size = H_q // H_k
-                query_grouped = query_states.view(B, H_k, group_size, L, d)
-                key_expanded_t = key_states.unsqueeze(2).transpose(-1, -2)
-                scores_scaled = torch.einsum("bghid, bghdj -> bghij", query_grouped, key_expanded_t) * self.scaling
-                attn_map_grouped = nn.functional.softmax(scores_scaled, dim=-1)
-                attn_weights = attn_map_grouped.view(B, H_q, L, L)
-
-                # attn_weights = nn.functional.softmax()
-        attn_output, _ = attention_interface(
+        attn_output, attn_weights = attention_interface(
             self,
             query_states,
             key_states,
@@ -553,6 +541,9 @@ class BambaMixer(nn.Module):
 
         self.exp_type = getattr(config, "exp_type", {}) # ["layer", "head", "erf", "longmamba"]
 
+        if "context_length" not in self.exp_type.keys():
+            self.exp_type["context_length"] = 4096
+
         # load head mask for scaling
         if "head" in self.exp_type.keys():
             data = {}
@@ -631,15 +622,15 @@ class BambaMixer(nn.Module):
             if "layer" in self.exp_type.keys():
                 if self.layer_idx in self.exp_type["layer"]:
                     A = A.clone()
-                    A *= 4096/self.seq_len
+                    A *= int(self.exp_type["context_length"])/self.seq_len
                     B = B.clone()
-                    B *= 4096/self.seq_len
+                    B *= int(self.exp_type["context_length"])/self.seq_len
 
             if "head" in self.exp_type.keys():
                 A = A.clone()
-                A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+                A[..., self.head_mask.to(A.device)] *= int(self.exp_type["context_length"])/self.seq_len
                 B = B.clone()
-                B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+                B[..., self.head_mask.to(B.device)] *= int(self.exp_type["context_length"])/self.seq_len
 
             D = self.D[:, None, ...].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
@@ -729,19 +720,18 @@ class BambaMixer(nn.Module):
                     dim=-1,
                 )
 
-                # PPL, here
                 if "layer" in self.exp_type.keys():
                     if self.layer_idx in self.exp_type["layer"]:
                         A = A.clone()
-                        A *= 4096/self.seq_len
+                        A *= int(self.exp_type["context_length"])/self.seq_len
                         B = B.clone()
-                        B *= 4096/self.seq_len
+                        B *= int(self.exp_type["context_length"])/self.seq_len
 
                 if "head" in self.exp_type.keys():
                     A = A.clone()
-                    A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+                    A[..., self.head_mask.to(A.device)] *= int(self.exp_type["context_length"])/self.seq_len
                     B = B.clone()
-                    B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+                    B[..., self.head_mask.to(B.device)] *= int(self.exp_type["context_length"])/self.seq_len
 
                 if "erf" in self.exp_type.keys():
                     mmd = mmd_from_ssd_inputs(
@@ -949,15 +939,15 @@ class BambaMixer(nn.Module):
         if "layer" in self.exp_type.keys():
             if self.layer_idx in self.exp_type["layer"]:
                 A = A.clone()
-                A *= 4096/self.seq_len
+                A *= int(self.exp_type["context_length"])/self.seq_len
                 B = B.clone()
-                B *= 4096/self.seq_len
+                B *= int(self.exp_type["context_length"])/self.seq_len
 
         if "head" in self.exp_type.keys():
             A = A.clone()
-            A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
+            A[..., self.head_mask.to(A.device)] *= int(self.exp_type["context_length"])/self.seq_len
             B = B.clone()
-            B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+            B[..., self.head_mask.to(B.device)] *= int(self.exp_type["context_length"])/self.seq_len
 
         dt_bias = self.dt_bias
         dt_softplus = True

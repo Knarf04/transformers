@@ -64,10 +64,12 @@ logger = logging.get_logger(__name__)
 
 
 _CONFIG_FOR_DOC = "Zyphra/Zamba2-2.7B"
-DEBUG = True
-SAVE_DIR = '/work/nvme/bcjw/hshen14/datasets/phonebook/logits'
-LOG_DIR = '/u/hshen14/LongBamba/experiments/zamba2_log.jsonl'
-import json
+
+import os
+from einops import rearrange
+
+from ...analysis.LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
+from ...analysis.mmd import mmd_from_gqa_inputs, mmd_from_ssd_inputs
 
 class Zamba2RMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, group_size, eps=1e-6):
@@ -356,30 +358,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-def mmd_from_gqa_inputs(query_states, key_states, attention_mask=None, scaling=1.0):
-    with torch.no_grad():
-        B, H_q, L, d = query_states.shape
-        H_k = key_states.shape[1]
-        group_size = H_q // H_k
-
-        q_last = query_states.view(B, H_k, group_size, L, d)[..., -1, :]
-        k = key_states.transpose(-2, -1).unsqueeze(2)
-        k = k.expand(-1, -1, group_size, -1, -1)
-
-        scores = torch.einsum("bghd,bghdj->bghj", q_last, k) * scaling
-
-        if attention_mask is not None:
-            m = attention_mask.to(query_states.dtype).unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(m == 0, float("-inf"))
-
-        attn_avg = F.softmax(scores, dim=-1).view(B, H_q, L).mean(dim=0)
-
-        dist = torch.arange(L - 1, -1, -1, dtype=attn_avg.dtype, device=attn_avg.device)
-        aw = torch.abs(attn_avg)
-        aw = aw / aw.sum(dim=-1, keepdim=True)
-        mmd = (aw * dist).sum(dim=-1)
-
-    return mmd
 
 class Zamba2Attention(nn.Module):
     """
@@ -464,6 +442,11 @@ class Zamba2Attention(nn.Module):
 
         self.layer_dic = {value: index for index, value in enumerate(self.layer_block_map)}
 
+        self.exp_type = getattr(config, "exp_type", {}) 
+
+        if "context_length" not in self.exp_type.keys():
+            self.exp_type["context_length"] = 4096
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -506,21 +489,24 @@ class Zamba2Attention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        if DEBUG:
-            curr_state = {}
-            curr_state['q'] = query_states
-            curr_state['k'] = key_states
-            curr_state['v'] = value_states
-            curr_state['mask'] = attention_mask
-            curr_state['scaling'] = self.scaling
+        if "erf" in self.exp_type.keys():
             mmd = mmd_from_gqa_inputs(query_states, key_states, attention_mask=attention_mask, scaling=self.scaling)
             record = {
                 "layer_idx": self.layer_idx,
                 "seq_len": query_states.shape[2],
                 "erf": mmd.tolist()
                 }
-            with open(LOG_DIR, 'a') as f:
+            with open(self.exp_type["erf"], 'a') as f:
                 f.write(json.dumps(record) + '\n')
+        
+        if "logits" in self.exp_type.keys():
+            curr_state = {}
+            curr_state['q'] = query_states
+            curr_state['k'] = key_states
+            curr_state['v'] = value_states
+            curr_state['mask'] = attention_mask
+            curr_state['scaling'] = self.scaling
+            torch.save(curr_state, os.path.join(self.exp_type["logits"], f'curr_state_{query_states.shape[2]}_{self.layer_idx}.pt'))
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -594,37 +580,6 @@ def segment_sum(input_tensor):
 
 is_fast_path_available = all((selective_state_update, causal_conv1d_fn, causal_conv1d_update))
 
-def mmd_from_ssd_inputs(dt, A, B, C, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
-    with torch.no_grad():
-        if dt_bias is not None:
-            dt = dt + dt_bias
-        if dt_softplus:
-            dt = F.softplus(dt)
-        if dt_limit is not None:
-            dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
-
-        A_dt = (A * dt).permute(0, 2, 1)    # (B, H, S)
-
-        rev = A_dt.flip(dims=(-1,))        # (B, H, S)
-        rev_cumsum = torch.cumsum(rev, dim=-1)  # (B, H, S),
-        zeros = torch.zeros_like(rev_cumsum[..., :1])
-        rev_cumsum_excl = torch.cat([zeros, rev_cumsum[..., :-1]], dim=-1)
-        tail_sum = rev_cumsum_excl.flip(dims=(-1,))  # (B, H, S)
-        L_last = torch.exp(tail_sum)       # (B, H, S)
-
-        C_last = C[:, -1, :, :]                        # (B, H, N)
-        Q = torch.einsum("bhn,bshn->bhs", C_last, B)
-        dt_hks = dt.permute(0, 2, 1)                    # (B, H, S)
-
-        raw = Q * L_last * dt_hks                       # (B, H, S)
-        aw  = raw.abs()
-        aw  = aw / aw.sum(dim=-1, keepdim=True)        # normalize over S
-        S = aw.size(-1)
-        dist = torch.arange(S-1, -1, -1, dtype=aw.dtype, device=aw.device)
-
-        mmd = torch.einsum("s,bhs->bh", dist, aw)
-
-    return mmd
 
 class Zamba2MambaMixer(nn.Module):
     """
@@ -692,16 +647,22 @@ class Zamba2MambaMixer(nn.Module):
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.add_bias_linear)
 
-                # load head mask for scaling
-        # data = {}
-        # with open("/u/hshen14/LongBamba/experiments/config/head_zamba.jsonl", "r") as f:
-        #     for line in f:
-        #         line = line.strip()
-        #         if not line:
-        #             continue
-        #         obj = json.loads(line)  
-        #         data.update(obj)
-        # self.head_mask = torch.tensor(data[f"{self.layer_idx}"], dtype=torch.bool)
+        self.exp_type = getattr(config, "exp_type", {}) # ["layer", "head", "erf", "longmamba"]
+
+        if "context_length" not in self.exp_type.keys():
+            self.exp_type["context_length"] = 4096
+
+        # load head mask for scaling
+        if "head" in self.exp_type.keys():
+            data = {}
+            with open(self.exp_type["head"], "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)  
+                    data.update(obj)
+            self.head_mask = torch.tensor(data[f"{self.layer_idx}"], dtype=torch.bool)
 
         if not is_fast_path_available:
             logger.warning_once(
@@ -747,42 +708,24 @@ class Zamba2MambaMixer(nn.Module):
             A = A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+
+            if "layer" in self.exp_type.keys():
+                if self.layer_idx in self.exp_type["layer"]:
+                    A = A.clone()
+                    A *= int(self.exp_type["context_length"])/self.seq_len
+                    B = B.clone()
+                    B *= int(self.exp_type["context_length"])/self.seq_len
+
+            if "head" in self.exp_type.keys():
+                A = A.clone()
+                A[..., self.head_mask.to(A.device)] *= int(self.exp_type["context_length"])/self.seq_len
+                B = B.clone()
+                B[..., self.head_mask.to(B.device)] *= int(self.exp_type["context_length"])/self.seq_len
+
             D = self.D[:, None, ...].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
             C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
             hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
-            
-            if DEBUG:
-                curr_state = {}
-                curr_state['hidden_states'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
-                curr_state['dt'] = dt
-                curr_state['A'] = A
-                curr_state['B'] = B.view(batch_size, seq_len, self.n_groups, -1)
-                curr_state['C'] = C.view(batch_size, seq_len, self.n_groups, -1)
-                curr_state['D'] = self.D
-                curr_state['dt_bias'] = self.dt_bias
-                mmd = mmd_from_ssd_inputs(dt, A, curr_state['B'], curr_state['C'], dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
-
-                record = {
-                    "layer_idx": self.layer_idx,
-                    "seq_len": self.seq_len,
-                    "erf": mmd.tolist()
-                    }
-                with open(LOG_DIR, 'a') as f:
-                    f.write(json.dumps(record) + '\n')
-            # Layer scale
-            # if self.layer_idx in [3, 6, 12, 14, 16, 19, 22]:
-            #     A = A.clone()
-            #     A *= 4096/self.seq_len
-            #     # dt = dt.clone()
-            #     # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
-            #     B = B.clone()
-            #     B *= 4096/self.seq_len
-            # Head scale
-            # A = A.clone()
-            # A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
-            # B = B.clone()
-            # B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
             hidden_states = selective_state_update(
                 cache_params.ssm_states[self.layer_idx],
                 hidden_states_reshaped,
@@ -800,6 +743,8 @@ class Zamba2MambaMixer(nn.Module):
             out = self.out_proj(hidden_states)[:, None, ...]
         # if no cache is found, calling the kernel
         else:
+            self.seq_len = seq_len # store seq_len for later scaling
+
             if attention_mask is not None and not torch.all(attention_mask == 1):
                 # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
                 dtype = hidden_states.dtype
@@ -814,6 +759,7 @@ class Zamba2MambaMixer(nn.Module):
                 input_not_masked = True
 
             if self.use_mem_eff_path and self.training and cache_params is None and input_not_masked:
+                assert False, "Warning: scaling not implemented!"
                 out, ssm_state = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
@@ -865,24 +811,134 @@ class Zamba2MambaMixer(nn.Module):
                     [self.intermediate_size, groups_time_state_size, groups_time_state_size],
                     dim=-1,
                 )
+
+                if "layer" in self.exp_type.keys():
+                    if self.layer_idx in self.exp_type["layer"]:
+                        A = A.clone()
+                        A *= int(self.exp_type["context_length"])/self.seq_len
+                        B = B.clone()
+                        B *= int(self.exp_type["context_length"])/self.seq_len
+
+                if "head" in self.exp_type.keys():
+                    A = A.clone()
+                    A[..., self.head_mask.to(A.device)] *= int(self.exp_type["context_length"])/self.seq_len
+                    B = B.clone()
+                    B[..., self.head_mask.to(B.device)] *= int(self.exp_type["context_length"])/self.seq_len
+
+                if "erf" in self.exp_type.keys():
+                    mmd = mmd_from_ssd_inputs(
+                        dt, 
+                        A, 
+                        B.view(batch_size, seq_len, self.n_groups, -1), 
+                        C.view(batch_size, seq_len, self.n_groups, -1), 
+                        dt_bias=self.dt_bias, 
+                        dt_softplus=True, 
+                        dt_limit=(0.0, float("inf"))
+                        )
+                    record = {
+                        "layer_idx": self.layer_idx,
+                        "seq_len": self.seq_len,
+                        "erf": mmd.tolist()
+                        }
+                    with open(self.exp_type["erf"], 'a') as f:
+                        f.write(json.dumps(record) + '\n')
+                    
+                if "logits" in self.exp_type.keys():
+                    curr_state = {}
+                    curr_state['hidden_states'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
+                    curr_state['dt'] = dt
+                    curr_state['A'] = A
+                    curr_state['B'] = B.view(batch_size, seq_len, self.n_groups, -1)
+                    curr_state['C'] = C.view(batch_size, seq_len, self.n_groups, -1)
+                    curr_state['D'] = self.D
+                    curr_state['dt_bias'] = self.dt_bias
+                    torch.save(curr_state, os.path.join(self.exp_type["logits"], f'curr_state_{seq_len}_{self.layer_idx}.pt'))
+
+                dt_bias = self.dt_bias
+                dt_softplus = True
+
+                if "longmamba" in self.exp_type.keys():
+                    # dt alignment
+                    params_for_debug = {}
+                    dt = nn.functional.softplus(dt + self.dt_bias)
+                    if False:
+                    # if merge_config is not None and merge_config['model_arch'] == "ours" and int(self.seq_len/1e3) > 2:
+                        channel_threshold = merge_config['c']
+                        tA_prod_path = f"./artifacts/{merge_config['align_path']}/tA_prod/tA_prod_layer_{self.layer_idx}.pt"
+                        alpha_path = f"./artifacts/{merge_config['align_path']}/alpha/alpha_layer_{self.layer_idx}.pt"
+                        decay_path = f"./artifacts/{merge_config['align_path']}/decay/decay_layer_{self.layer_idx}.pt"
+                        dt_thre_path = f"./artifacts/{merge_config['align_path']}/delta_t-thre/delta_t-thre_layer_{self.layer_idx}.pt"
+                        tA_prod = torch.load(tA_prod_path, map_location=dt.device)
+                        self.channel_mask = tA_prod > channel_threshold
+                        whether_mask = self.channel_mask.sum() != 0
+                        available_values = []
+                        if merge_config['our_method'] in ["alpha", "offline"]:
+                            alpha_all = torch.load(alpha_path, map_location=dt.device)
+                            for k in alpha_all:
+                                available_values.append(int(k[:-1])*1e3)
+                        elif merge_config['our_method'] in ["bound", "norm"]:  
+                            decay = torch.load(decay_path, map_location=dt.device)
+                        elif merge_config['our_method'] in ["dt_thre"]:
+                            dt_thre_all = torch.load(dt_thre_path, map_location=dt.device)
+                            for k in dt_thre_all:
+                                available_values.append(int(k[:-1])*1e3)
+                            
+                        self.slow_factor = 0
+                        self.topk = 2000
+                        dt = rearrange(dt, "b l h -> b h l")
+                        if merge_config['our_method'] == "channelwise_topk" and whether_mask:
+                            topk_mask = get_topk_mask_channelwise(delta_t=dt[:, self.channel_mask], k=self.topk)
+                            dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                        elif merge_config['our_method'] == "all_topk" and whether_mask:
+                            topk_indice = get_top_k_token_indices(dt[:, self.channel_mask], k=self.topk)
+                            topk_mask = torch.zeros_like(dt[:, self.channel_mask], dtype=torch.bool)
+                            topk_mask[:,:,topk_indice] = True
+                            dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                        elif whether_mask and merge_config['b'] != 0:
+                            key_num = int(min(available_values, key=lambda x: abs(self.seqlen - x))/1e3) if available_values != [] else None
+                            if "alpha" in merge_config['our_method']:
+                                channel_alpha = alpha_all[f"{key_num}k"].to(dt.device)
+                                topk_mask = get_channelwise_topAlpha(delta_t=dt[:, self.channel_mask], alpha=channel_alpha[self.channel_mask]*merge_config['b'])
+                                dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                            elif "offline" in merge_config['our_method']:
+                                key_num_offline = int(min(available_values, key=lambda x: abs(self.seqlen - x))/1e3)
+                                channel_alpha = alpha_all[f"{key_num_offline}k"].to(dt.device)
+                                topk_mask, _ = get_channelwise_offline(delta_t=dt[:, self.channel_mask], alpha=channel_alpha[self.channel_mask]*merge_config['b'])
+                                dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                            elif "bound" in merge_config['our_method']:
+                                topk_mask = get_channelwise_topBound(delta_t=dt[:, self.channel_mask], decay=decay[self.channel_mask]*merge_config['b'])
+                                dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                            elif "norm" in merge_config['our_method']:
+                                dt_norm = get_channelwise_normalize(delta_t=dt[:, self.channel_mask], decay=decay[self.channel_mask]*merge_config['b'])
+                                dt[:, self.channel_mask] = dt_norm
+                            elif "dt_thre" in merge_config['our_method']:
+                                channel_dt_thre_all = dt_thre_all[f"{key_num}k"].to(dt.device)
+                                # self.dt_thre[f"layer_{self.layer_idx}"] = channel_dt_thre_all
+                                topk_mask = get_channelwise_dt_threshold(delta_t=dt[:, self.channel_mask], dt_thre=channel_dt_thre_all[self.channel_mask]*merge_config['b'])
+                                dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                        else:
+                            if whether_mask:
+                                print("Warning: no method is applied")
+                            dt[:, self.channel_mask] = dt[:, self.channel_mask] * 0
+                        dt = rearrange(dt, "b h l -> b l h")
+                    if merge_config['save_para4debug']:
+                        params_for_debug['A'] = A.clone().cpu()
+                        params_for_debug['Sb_x'] = B.clone().cpu()  # B before discretization
+                        params_for_debug['C'] = C.clone().cpu()
+                        params_for_debug['delta_t'] = dt.clone().cpu()
+                        print("Save parameters mamba2 debug")
+                        params_for_debug['B_t'] = None
+                    
+                    dt_bias = None
+                    dt_softplus = False
+                    # Change params_for_debug from outputing to saving to log file
+                    with open(self.exp_type["longmamba"], 'a') as f:
+                        f.write(json.dumps(params_for_debug) + '\n')
+
                 if attention_mask is not None and not torch.all(attention_mask == 1):
                     # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
                     dtype = hidden_states.dtype
                     hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
-                
-                # Layer scale
-                # if self.layer_idx in [3, 6, 12, 14, 16, 19, 22]:
-                #     A = A.clone()
-                #     A *= 4096/self.seq_len
-                #     # dt = dt.clone()
-                #     # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
-                #     B = B.clone()
-                #     B *= 4096/self.seq_len
-                # Head scale
-                # A = A.clone()
-                # A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
-                # B = B.clone()
-                # B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
 
                 scan_output, ssm_state = mamba_chunk_scan_combined(
                     hidden_states.view(batch_size, seq_len, -1, self.head_dim),
@@ -895,8 +951,8 @@ class Zamba2MambaMixer(nn.Module):
                     z=None,
                     seq_idx=None,
                     return_final_states=True,
-                    dt_bias=self.dt_bias,
-                    dt_softplus=True,
+                    dt_bias=dt_bias,
+                    dt_softplus=dt_softplus,
                     **dt_limit_kwargs,
                 )
                 if ssm_state is not None and cache_params is not None:
@@ -960,38 +1016,98 @@ class Zamba2MambaMixer(nn.Module):
         hidden_states, B, C = torch.split(hidden_states, [self.intermediate_size, self.n_groups * self.ssm_state_size, self.n_groups * self.ssm_state_size], dim=-1)
         A = -torch.exp(self.A_log.float())                            # [num_heads]
 
-        if DEBUG:
-            curr_state = {}
-            curr_state['hidden_states'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
-            curr_state['dt'] = dt
-            curr_state['A'] = A
-            curr_state['B'] = B.view(batch_size, seq_len, self.n_groups, -1)
-            curr_state['C'] = C.view(batch_size, seq_len, self.n_groups, -1)
-            curr_state['D'] = self.D
-            curr_state['dt_bias'] = self.dt_bias
-            mmd = mmd_from_ssd_inputs(dt, A, curr_state['B'], curr_state['C'], dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
+        if "layer" in self.exp_type.keys():
+            if self.layer_idx in self.exp_type["layer"]:
+                A = A.clone()
+                A *= int(self.exp_type["context_length"])/self.seq_len
+                B = B.clone()
+                B *= int(self.exp_type["context_length"])/self.seq_len
 
-            record = {
-                "layer_idx": self.layer_idx,
-                "seq_len": self.seq_len,
-                "erf": mmd.tolist()
-                }
-            with open(LOG_DIR, 'a') as f:
-                f.write(json.dumps(record) + '\n')
+        if "head" in self.exp_type.keys():
+            A = A.clone()
+            A[..., self.head_mask.to(A.device)] *= int(self.exp_type["context_length"])/self.seq_len
+            B = B.clone()
+            B[..., self.head_mask.to(B.device)] *= int(self.exp_type["context_length"])/self.seq_len
 
-        # Layer scale
-        # if self.layer_idx in [3, 6, 12, 14, 16, 19, 22]:
-        #     A = A.clone()
-        #     A *= 4096/self.seq_len
-        #     # dt = dt.clone()
-        #     # dt *= inplace_scale(4096/seq_len, dt, self.dt_bias)
-        #     B = B.clone()
-        #     B *= 4096/self.seq_len
-        # Head scale
-        # A = A.clone()
-        # A[..., self.head_mask.to(A.device)] *= 4096/self.seq_len
-        # B = B.clone()
-        # B[..., self.head_mask.to(B.device)] *= 4096/self.seq_len
+        dt_bias = self.dt_bias
+        dt_softplus = True
+
+        if "longmamba" in self.exp_type.keys():
+            # dt alignment
+            params_for_debug = {}
+            dt = nn.functional.softplus(dt + self.dt_bias)
+            if merge_config is not None and merge_config['model_arch'] == "ours" and int(self.seq_len/1e3) > 2:
+                channel_threshold = merge_config['c']
+                tA_prod_path = f"./artifacts/{merge_config['align_path']}/tA_prod/tA_prod_layer_{self.layer_idx}.pt"
+                alpha_path = f"./artifacts/{merge_config['align_path']}/alpha/alpha_layer_{self.layer_idx}.pt"
+                decay_path = f"./artifacts/{merge_config['align_path']}/decay/decay_layer_{self.layer_idx}.pt"
+                dt_thre_path = f"./artifacts/{merge_config['align_path']}/delta_t-thre/delta_t-thre_layer_{self.layer_idx}.pt"
+                tA_prod = torch.load(tA_prod_path, map_location=dt.device)
+                self.channel_mask = tA_prod > channel_threshold
+                whether_mask = self.channel_mask.sum() != 0
+                available_values = []
+                if merge_config['our_method'] in ["alpha", "offline"]:
+                    alpha_all = torch.load(alpha_path, map_location=dt.device)
+                    for k in alpha_all:
+                        available_values.append(int(k[:-1])*1e3)
+                elif merge_config['our_method'] in ["bound", "norm"]:  
+                    decay = torch.load(decay_path, map_location=dt.device)
+                elif merge_config['our_method'] in ["dt_thre"]:
+                    dt_thre_all = torch.load(dt_thre_path, map_location=dt.device)
+                    for k in dt_thre_all:
+                        available_values.append(int(k[:-1])*1e3)
+                    
+                self.slow_factor = 0
+                self.topk = 2000
+                dt = rearrange(dt, "b l h -> b h l")
+                if merge_config['our_method'] == "channelwise_topk" and whether_mask:
+                    topk_mask = get_topk_mask_channelwise(delta_t=dt[:, self.channel_mask], k=self.topk)
+                    dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                elif merge_config['our_method'] == "all_topk" and whether_mask:
+                    topk_indice = get_top_k_token_indices(dt[:, self.channel_mask], k=self.topk)
+                    topk_mask = torch.zeros_like(dt[:, self.channel_mask], dtype=torch.bool)
+                    topk_mask[:,:,topk_indice] = True
+                    dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                elif whether_mask and merge_config['b'] != 0:
+                    key_num = int(min(available_values, key=lambda x: abs(self.seqlen - x))/1e3) if available_values != [] else None
+                    if "alpha" in merge_config['our_method']:
+                        channel_alpha = alpha_all[f"{key_num}k"].to(dt.device)
+                        topk_mask = get_channelwise_topAlpha(delta_t=dt[:, self.channel_mask], alpha=channel_alpha[self.channel_mask]*merge_config['b'])
+                        dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                    elif "offline" in merge_config['our_method']:
+                        key_num_offline = int(min(available_values, key=lambda x: abs(self.seqlen - x))/1e3)
+                        channel_alpha = alpha_all[f"{key_num_offline}k"].to(dt.device)
+                        topk_mask, _ = get_channelwise_offline(delta_t=dt[:, self.channel_mask], alpha=channel_alpha[self.channel_mask]*merge_config['b'])
+                        dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                    elif "bound" in merge_config['our_method']:
+                        topk_mask = get_channelwise_topBound(delta_t=dt[:, self.channel_mask], decay=decay[self.channel_mask]*merge_config['b'])
+                        dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                    elif "norm" in merge_config['our_method']:
+                        dt_norm = get_channelwise_normalize(delta_t=dt[:, self.channel_mask], decay=decay[self.channel_mask]*merge_config['b'])
+                        dt[:, self.channel_mask] = dt_norm
+                    elif "dt_thre" in merge_config['our_method']:
+                        channel_dt_thre_all = dt_thre_all[f"{key_num}k"].to(dt.device)
+                        # self.dt_thre[f"layer_{self.layer_idx}"] = channel_dt_thre_all
+                        topk_mask = get_channelwise_dt_threshold(delta_t=dt[:, self.channel_mask], dt_thre=channel_dt_thre_all[self.channel_mask]*merge_config['b'])
+                        dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+                else:
+                    if whether_mask:
+                        print("Warning: no method is applied")
+                    dt[:, self.channel_mask] = dt[:, self.channel_mask] * 0
+                dt = rearrange(dt, "b h l -> b l h")
+            if merge_config['save_para4debug']:
+                params_for_debug['A'] = A.clone().cpu()
+                params_for_debug['Sb_x'] = B.clone().cpu()  # B before discretization
+                params_for_debug['C'] = C.clone().cpu()
+                params_for_debug['delta_t'] = dt.clone().cpu()
+                print("Save parameters mamba2 debug")
+                params_for_debug['B_t'] = None
+            
+            dt_bias = None
+            dt_softplus = False
+            # Change params_for_debug from outputing to saving to log file
+            with open(self.exp_type["longmamba"], 'a') as f:
+                f.write(json.dumps(params_for_debug) + '\n')
 
         if cache_params is not None and cache_params.has_previous_state:
             # Note: there is no need to pad parameter matrices here, as there is just one new token
@@ -999,9 +1115,14 @@ class Zamba2MambaMixer(nn.Module):
             dt = dt[:, None, ...] if dt.ndim == 2 else dt[:, 0, :][:, None, ...]
             dt = dt.transpose(1, 2).expand(batch_size, dt.shape[-1], self.head_dim)
             # [num_heads] -> [num_heads, head_dim]
-            dt_bias = self.dt_bias[..., None].expand(self.dt_bias.shape[0], self.head_dim)
+            
+            if dt_bias:
+                dt_bias = self.dt_bias[..., None].expand(self.dt_bias.shape[0], self.head_dim)
+                dt += dt_bias.to(dt.dtype)
 
-            dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
+            if dt_softplus:
+                dt = nn.functional.softplus(dt)
+
             dt = torch.clamp(dt, self.time_step_min) #, self.time_step_max)
             A = A[..., None, None].expand(self.num_heads, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
             # [bsz, num_heads, head_dim, state_size]
@@ -1049,7 +1170,12 @@ class Zamba2MambaMixer(nn.Module):
             y = y.reshape(batch_size, -1)[:, None, ...]
         else:
             # begin ssd naive implementation without einsums
-            dt = nn.functional.softplus(dt + self.dt_bias)
+            if dt_bias:
+                dt += dt_bias
+
+            if dt_softplus:
+                dt = nn.functional.softplus(dt)
+
             dt = torch.clamp(dt, self.time_step_min)
             hidden_states = hidden_states.reshape(batch_size, seq_len, -1, self.head_dim).float()
             B = B.reshape(batch_size, seq_len,  -1, self.ssm_state_size).float()
