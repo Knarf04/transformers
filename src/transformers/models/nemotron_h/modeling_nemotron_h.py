@@ -31,6 +31,7 @@ from ...modeling_attn_mask_utils import (
     AttentionMaskConverter,
 )
 from ...modeling_utils import PreTrainedModel, ALL_ATTENTION_FUNCTIONS
+from ...utils.deprecation import deprecate_kwarg
 from ...utils import (
     ModelOutput,
     add_code_sample_docstrings,
@@ -86,6 +87,7 @@ is_fast_path_available = all(
 _CHECKPOINT_FOR_DOC = "nvidia/Nemotron-H-56B-Base-8K"
 _CONFIG_FOR_DOC = "NemotronHConfig"
 
+import json
 import os
 from einops import rearrange
 
@@ -1709,6 +1711,7 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         )
         return model_inputs
 
+    @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     @add_start_docstrings_to_model_forward(NEMOTRONH_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
@@ -1728,6 +1731,7 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,  # for now we need this for generation
     ) -> Union[Tuple, NemotronHCausalLMOutput]:
         r"""
@@ -1755,10 +1759,11 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
             attention_mask=attention_mask,
         )
         hidden_states = nemotron_h_outputs[0]
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
         # TODO: Check zamba_modeling.py: https://github.com/huggingface/transformers/blob/d7188ba600e36d3fd191b12e19f1b3bb81a8404f/src/transformers/models/zamba/modeling_zamba.py#L1284C1-L1286C2
         #logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
-        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+        logits = self.lm_head(hidden_states[:, slice_indices, :].to(self.lm_head.weight.dtype)).float()
 
         loss = None
         if labels is not None:

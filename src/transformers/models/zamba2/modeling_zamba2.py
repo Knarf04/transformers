@@ -65,6 +65,7 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "Zyphra/Zamba2-2.7B"
 
+import json
 import os
 from einops import rearrange
 
@@ -782,7 +783,7 @@ class Zamba2MambaMixer(nn.Module):
                 )
 
             else:
-                gate, hidden_states_B_C, time_step = torch.split(
+                gate, hidden_states_B_C, dt = torch.split(
                     projected_states,
                     [self.intermediate_size, self.conv_dim, self.num_heads],
                     dim=-1,
@@ -942,7 +943,7 @@ class Zamba2MambaMixer(nn.Module):
 
                 scan_output, ssm_state = mamba_chunk_scan_combined(
                     hidden_states.view(batch_size, seq_len, -1, self.head_dim),
-                    time_step,
+                    dt,
                     A,
                     B.view(batch_size, seq_len, self.n_groups, -1),
                     C.view(batch_size, seq_len, self.n_groups, -1),

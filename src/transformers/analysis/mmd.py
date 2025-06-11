@@ -52,10 +52,10 @@ def mmd_from_ssd_inputs(dt, A, B, C, dt_bias=None, dt_softplus=True, dt_limit=(0
         L_last = torch.exp(tail_sum)       # (B, H, S)
 
         C_last = C[:, -1, :, :]                        # (B, H, N)
-        Q = torch.einsum("bhn,bshn->bhs", C_last, B)
-        dt_hks = dt.permute(0, 2, 1)                    # (B, H, S)
+        Q = torch.einsum("bhn,bshn->bs", C_last, B)
+        dt_hks = dt.permute(0, 2, 1)                   # (B, H, S)
 
-        raw = Q * L_last * dt_hks                       # (B, H, S)
+        raw = Q * L_last * dt_hks                      # (B, H, S)
         aw  = raw.abs()
         aw  = aw / aw.sum(dim=-1, keepdim=True)        # normalize over S
         S = aw.size(-1)

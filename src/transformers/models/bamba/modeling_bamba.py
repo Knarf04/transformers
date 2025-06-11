@@ -28,7 +28,6 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 from torch import nn
-import json
 
 import transformers.models.jamba.modeling_jamba as modeling_jamba
 from transformers.activations import ACT2FN
@@ -73,6 +72,7 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "BambaConfig"
 
+import json
 import os
 from einops import rearrange
 
