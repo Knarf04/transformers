@@ -9,3 +9,7 @@ def scale_dt(scale_mask, dt, dt_bias):
     t = F.softplus(dt + dt_bias) / scale_mask
     y = torch.expm1(t).clamp_min(1e-6)
     return torch.log(y) - dt_bias
+
+def dynamic_scale_mask(scale_mask, seq_len, seq_len_scaled=32768, seq_len_trained=4096):
+    scale = max(0, (seq_len-seq_len_trained)/(seq_len_scaled-seq_len_trained))
+    return scale * (scale_mask - 1) + 1
