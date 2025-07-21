@@ -559,6 +559,7 @@ class BambaMixer(nn.Module):
             if os.path.isfile(mask_file):
                 mask = torch.load(mask_file)[self.layer_idx]
                 self.upi_mask.copy_(mask) # (nheads,)
+            self.upi_dynamic = False # TODO: enable dynamic handling in config
         
         self.seq_len = 0
         if "seq_len_scaled" in self.experiments.keys():
@@ -647,8 +648,11 @@ class BambaMixer(nn.Module):
             dt_softplus = True
             if "upi" in self.experiments.keys():
                 # Precompute scaled delta and disable later ones
-                upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
-                print(f"[DEBUG] use_precomputed_states, seq_len = {self.seq_len}")
+                if self.upi_dynamic:
+                    upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                else:
+                    upi_mask = self.upi_mask
+                # print(f"[DEBUG] use_precomputed_states, seq_len = {self.seq_len}")
                 dt = nn.functional.softplus(dt + dt_bias) / upi_mask
                 dt_bias = None
                 dt_softplus = False
@@ -684,8 +688,11 @@ class BambaMixer(nn.Module):
             # 2-4. Fused kernel for conv1d, SSM, and the final projection
             if self.training and cache_params is None:
                 if "upi" in self.experiments.keys():
-                    upi_mask = dynamic_scale_mask(self.upi_mask, seq_len, self.seq_len_scaled, self.seq_len_trained)
-                    print(f"[DEBUG] mamba_split_conv1d_scan_combined, seq_len = {self.seq_len}")
+                    if self.upi_dynamic:
+                        upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                    else:
+                        upi_mask = self.upi_mask
+                    # print(f"[DEBUG] mamba_split_conv1d_scan_combined, seq_len = {self.seq_len}")
                     zxbc, dt = projected_states.split(
                         [self.intermediate_size + self.conv_dim, self.num_heads], dim=-1
                     )
@@ -780,8 +787,11 @@ class BambaMixer(nn.Module):
                 dt_softplus = True
                 if "upi" in self.experiments.keys():
                     # Precompute scaled delta and disable later ones
-                    upi_mask = dynamic_scale_mask(self.upi_mask, seq_len, self.seq_len_scaled, self.seq_len_trained)
-                    print(f"[DEBUG] mamba_chunk_scan_combined, seq_len = {self.seq_len}")
+                    if self.upi_dynamic:
+                        upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                    else:
+                        upi_mask = self.upi_mask                    
+                    # print(f"[DEBUG] mamba_chunk_scan_combined, seq_len = {self.seq_len}")
                     dt = nn.functional.softplus(dt + self.dt_bias) / upi_mask
                     dt_bias = None
                     dt_softplus = False
@@ -971,8 +981,11 @@ class BambaMixer(nn.Module):
             dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
             
             if "upi" in self.experiments.keys():
-                upi_mask = dynamic_scale_mask(self.upi_mask, seq_len, self.seq_len_scaled, self.seq_len_trained)
-                print(f"[DEBUG] use_precomputed_states, torch, seq_len = {self.seq_len}")
+                if self.upi_dynamic:
+                    upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                else:
+                    upi_mask = self.upi_mask
+                # print(f"[DEBUG] use_precomputed_states, torch, seq_len = {self.seq_len}")
                 dt = dt / upi_mask
 
             dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
@@ -1026,8 +1039,11 @@ class BambaMixer(nn.Module):
             dt = nn.functional.softplus(dt + self.dt_bias)
             
             if "upi" in self.experiments.keys():
-                upi_mask = dynamic_scale_mask(self.upi_mask, seq_len, self.seq_len_scaled, self.seq_len_trained)
-                print(f"[DEBUG] not use_precomputed_states, torch, seq_len = {self.seq_len}")
+                if self.upi_dynamic:
+                    upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                else:
+                    upi_mask = self.upi_mask
+                # print(f"[DEBUG] not use_precomputed_states, torch, seq_len = {self.seq_len}")
                 dt = dt / upi_mask
 
             dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
