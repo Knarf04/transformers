@@ -555,8 +555,10 @@ class BambaMixer(nn.Module):
 
         self.register_buffer('upi_mask', torch.ones(self.num_heads), persistent=True)
         if "upi" in self.experiments.keys():
-            mask = torch.load(self.experiments["upi"])[self.layer_idx]
-            self.upi_mask.copy_(mask) # (nheads,)
+            mask_file = self.experiments["upi"]
+            if os.path.isfile(mask_file):
+                mask = torch.load(mask_file)[self.layer_idx]
+                self.upi_mask.copy_(mask) # (nheads,)
         
         self.seq_len = 0
         if "seq_len_scaled" in self.experiments.keys():
