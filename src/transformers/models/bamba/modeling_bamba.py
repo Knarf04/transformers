@@ -646,6 +646,7 @@ class BambaMixer(nn.Module):
             if "upi" in self.experiments.keys():
                 # Precompute scaled delta and disable later ones
                 upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                print(f"[DEBUG] use_precomputed_states, seq_len = {self.seq_len}")
                 dt = nn.functional.softplus(dt + dt_bias) / upi_mask
                 dt_bias = None
                 dt_softplus = False
@@ -682,6 +683,7 @@ class BambaMixer(nn.Module):
             if self.training and cache_params is None:
                 if "upi" in self.experiments.keys():
                     upi_mask = dynamic_scale_mask(self.upi_mask, seq_len, self.seq_len_scaled, self.seq_len_trained)
+                    print(f"[DEBUG] mamba_split_conv1d_scan_combined, seq_len = {self.seq_len}")
                     zxbc, dt = projected_states.split(
                         [self.intermediate_size + self.conv_dim, self.num_heads], dim=-1
                     )
@@ -777,6 +779,7 @@ class BambaMixer(nn.Module):
                 if "upi" in self.experiments.keys():
                     # Precompute scaled delta and disable later ones
                     upi_mask = dynamic_scale_mask(self.upi_mask, seq_len, self.seq_len_scaled, self.seq_len_trained)
+                    print(f"[DEBUG] mamba_chunk_scan_combined, seq_len = {self.seq_len}")
                     dt = nn.functional.softplus(dt + self.dt_bias) / upi_mask
                     dt_bias = None
                     dt_softplus = False
@@ -967,6 +970,7 @@ class BambaMixer(nn.Module):
             
             if "upi" in self.experiments.keys():
                 upi_mask = dynamic_scale_mask(self.upi_mask, seq_len, self.seq_len_scaled, self.seq_len_trained)
+                print(f"[DEBUG] use_precomputed_states, torch, seq_len = {self.seq_len}")
                 dt = dt / upi_mask
 
             dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
@@ -1021,6 +1025,7 @@ class BambaMixer(nn.Module):
             
             if "upi" in self.experiments.keys():
                 upi_mask = dynamic_scale_mask(self.upi_mask, seq_len, self.seq_len_scaled, self.seq_len_trained)
+                print(f"[DEBUG] not use_precomputed_states, torch, seq_len = {self.seq_len}")
                 dt = dt / upi_mask
 
             dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
