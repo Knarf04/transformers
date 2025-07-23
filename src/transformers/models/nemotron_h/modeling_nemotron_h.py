@@ -92,7 +92,7 @@ import os
 from einops import rearrange
 
 from ...analysis.LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
-from ...analysis.mmd import mmd_from_gqa_inputs, mmd_from_ssd_inputs
+from ...analysis.mmd import mmd_gqa_last, mmd_ssd_last, mmd_ssd_full_chunk
 
 # Helper methods for segment sum computation
 
@@ -536,7 +536,7 @@ class NemotronHMamba2Mixer(nn.Module):
                     B[..., self.head_mask.to(B.device)] *= int(self.exp_type["context_length"])/self.seq_len
 
                 if "erf" in self.exp_type.keys():
-                    mmd = mmd_from_ssd_inputs(
+                    mmd = mmd_ssd_last(
                         dt, 
                         A, 
                         B.view(batch_size, seq_len, self.n_groups, -1), 
@@ -1214,7 +1214,7 @@ class NemotronHAttention(nn.Module):
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         
         if "erf" in self.exp_type.keys():
-            mmd = mmd_from_gqa_inputs(query_states, key_states, attention_mask=attention_mask, scaling=self.scaling)
+            mmd = mmd_gqa_last(query_states, key_states, attention_mask=attention_mask, scaling=self.scaling)
             record = {
                 "layer_idx": self.layer_idx,
                 "seq_len": query_states.shape[2],
