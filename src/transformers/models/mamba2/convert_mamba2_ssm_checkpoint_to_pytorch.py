@@ -18,7 +18,7 @@ import argparse
 import json
 from functools import partial
 from os import path
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 from safetensors import safe_open
@@ -27,7 +27,7 @@ from safetensors.torch import save_model
 from transformers import GPTNeoXTokenizerFast, LlamaTokenizerFast, Mamba2Config, Mamba2ForCausalLM
 
 
-def load_state_dict_from_safetensors(mamba2_checkpoint_path: str, ckpt_name: str) -> Dict[str, torch.Tensor]:
+def load_state_dict_from_safetensors(mamba2_checkpoint_path: str, ckpt_name: str) -> dict[str, torch.Tensor]:
     # Load weights and config from paths
     original_state_dict = {}
     with safe_open(path.join(mamba2_checkpoint_path, ckpt_name), framework="pt") as f:
@@ -37,13 +37,15 @@ def load_state_dict_from_safetensors(mamba2_checkpoint_path: str, ckpt_name: str
     return original_state_dict
 
 
-def load_state_dict_from_torch(mamba2_checkpoint_path: str, ckpt_name: str) -> Dict[str, torch.Tensor]:
-    return torch.load(path.join(mamba2_checkpoint_path, ckpt_name), map_location="cpu")
+def load_state_dict_from_torch(mamba2_checkpoint_path: str, ckpt_name: str) -> dict[str, torch.Tensor]:
+    return torch.load(path.join(mamba2_checkpoint_path, ckpt_name), map_location="cpu", weights_only=True)
 
 
-def convert_ssm_config_to_hf_config(config_ssm: Dict, mamba2_model_dict: Dict) -> Mamba2Config:
+def convert_ssm_config_to_hf_config(config_ssm: dict, mamba2_model_dict: dict) -> Mamba2Config:
     """Convert a Mamba2Config from mamba_ssm to a Mamba2Config from here."""
     hf_config = Mamba2Config()
+    hf_config.architectures = ["Mamba2ForCausalLM"]
+    hf_config.max_position_embeddings = 262144
 
     # Switch to a different dict depending on model type
     config_dict = mamba2_model_dict
@@ -52,7 +54,9 @@ def convert_ssm_config_to_hf_config(config_ssm: Dict, mamba2_model_dict: Dict) -
     hf_config.hidden_size = config_ssm[config_dict["hidden_size"]]
     hf_config.num_heads = (hf_config.hidden_size * hf_config.expand) // hf_config.head_dim
     hf_config.num_hidden_layers = config_ssm[config_dict["num_hidden_layers"]]
-    hf_config.n_groups = config_ssm.get(config_dict["n_groups"], 1)
+    # hf_config.n_groups = config_ssm.get(config_dict["n_groups"], 1)
+    ssm_cfg = config_ssm.get("ssm_cfg", {})
+    hf_config.n_groups = ssm_cfg.get(config_dict["n_groups"], 1)
     hf_config.tie_word_embeddings = config_ssm["tie_embeddings"]
     hf_config.bos_token_id = config_dict["bos_token_id"]
     hf_config.pad_token_id = config_dict["pad_token_id"]
@@ -156,8 +160,6 @@ if __name__ == "__main__":
         "--mamba2_model_type",
         type=str,
         default="mamba_ssm",
-        const="mamba_ssm",
-        required=True,
         choices=("codestral", "mamba_ssm"),
         help="The model type the conversion will be performed on. Can choose from either `codestral` or `mamba_ssm`.",
     )
@@ -165,9 +167,7 @@ if __name__ == "__main__":
         "-p",
         "--precision",
         type=str,
-        default="fp16",
-        const="fp16",
-        required=True,
+        default="fp32",
         choices=("fp32", "fp16", "bf16"),
         help="The precision the model will be saved in. Select from fp32, fp16 or bf16.",
     )

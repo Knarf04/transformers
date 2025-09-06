@@ -77,7 +77,7 @@ import os
 
 from ...analysis.LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
 from ...analysis.mmd import mmd_gqa_last, mmd_ssd_last, mmd_ssd_full_chunk
-from ...analysis.upi import scale_dt, dynamic_scale_mask
+from ...analysis.upi import scale_dt, dynamic_scale_mask, scale_proper
 
 # Adapted from transformers.models.jamba.modeling_jamba.HybridMambaAttentionDynamicCache for the v2 mixer
 class HybridMambaAttentionDynamicCache(modeling_jamba.HybridMambaAttentionDynamicCache):
@@ -343,7 +343,7 @@ class BambaAttention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        # if "erf" in self.experiments.keys():
+        # if "erf" in self.experiments:
         #     mmd = mmd_from_gqa_inputs(query_states, key_states, attention_mask=attention_mask, scaling=self.scaling)
         #     record = {
         #         "layer_idx": self.layer_idx,
@@ -353,7 +353,7 @@ class BambaAttention(nn.Module):
         #     with open(self.experiments["erf"], 'a') as f:
         #         f.write(json.dumps(record) + '\n')
         
-        # if "logits" in self.experiments.keys():
+        # if "logits" in self.experiments:
         #     curr_state = {}
         #     curr_state['q'] = query_states
         #     curr_state['k'] = key_states
@@ -551,35 +551,28 @@ class BambaMixer(nn.Module):
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=self.use_bias)
 
-        self.experiments = getattr(config, "experiments", {}) # ["layer", "head", "erf", "longmamba"]
+        self.experiments = getattr(config, "experiments", {}) 
 
-        self.register_buffer('upi_mask', torch.ones(self.num_heads), persistent=True)
-        if "upi" in self.experiments.keys():
-            mask_file = self.experiments["upi"]
-            if os.path.isfile(mask_file):
-                mask = torch.load(mask_file)[self.layer_idx]
-                self.upi_mask.copy_(mask) # (nheads,)
-            self.upi_dynamic = False # TODO: enable dynamic handling in config
+        # self.register_buffer('upi_mask', torch.ones(self.num_heads), persistent=True)
+        # if "upi" in self.experiments:
+        #     mask_file = self.experiments["upi"]
+        #     if os.path.isfile(mask_file):
+        #         mask = torch.load(mask_file)[self.layer_idx]
+        #         self.upi_mask.copy_(mask) # (nheads,)
+        #     self.upi_dynamic = False # TODO: enable dynamic handling in config
         
-        self.seq_len = 0
-        if "seq_len_scaled" in self.experiments.keys():
-            self.seq_len_scaled = self.experiments["seq_len_scaled"]
-        else:
-            self.seq_len_scaled = 32768
-        
-        if "seq_len_trained" in self.experiments.keys():
-            self.seq_len_trained = self.experiments["seq_len_trained"]
-        else:
-            self.seq_len_trained = 4096
+        self.seq_len = 0 # Record current sequence length, including seen by cache
+        if "proper_upi" in self.experiments:
+            if "seq_len_scaled" in self.experiments["proper_upi"]:
+                self.seq_len_scaled = self.experiments["proper_upi"]["seq_len_scaled"]
+            else:
+                self.seq_len_scaled = 32768
 
-        self.h5_init = True
-        self.erf_rec = True
-        if "erf" in self.experiments.keys():
-            self.h5_init = False
-        
-        self.logits_rec = False
-        if "logits" in self.experiments.keys():
-            self.logits_rec = True
+            if "seq_len_trained" in self.experiments["proper_upi"]:
+                self.seq_len_trained = self.experiments["proper_upi"]["seq_len_trained"]
+            else:
+                self.seq_len_trained = 4096
+            self.upi_interpolation_scale = self.seq_len_trained / self.seq_len_scaled
 
         if not is_fast_path_available:
             logger.warning_once(
@@ -646,7 +639,7 @@ class BambaMixer(nn.Module):
             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
 
             dt_softplus = True
-            if "upi" in self.experiments.keys():
+            if "upi" in self.experiments:
                 # Precompute scaled delta and disable later ones
                 if self.upi_dynamic:
                     upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
@@ -655,6 +648,18 @@ class BambaMixer(nn.Module):
                 dt = nn.functional.softplus(dt + dt_bias) / upi_mask[:, None]
                 dt_bias = None
                 dt_softplus = False
+            
+            if "proper_upi" in self.experiments:
+                X = rearrange(X, "b l (h p) -> b l h p", h=A.shape[0])
+                dt_sp = F.softplus((dt + dt_bias).to(dtype=torch.float32)).to(dtype=dt.dtype)
+
+                if abs(scale - 1) < 1e-6:
+                    return A, X, dt_sp
+                
+                sA = A * scale
+                x_scale = torch.expm1(sA * dt_sp) / torch.expm1(A * dt_sp)
+                sX = X * x_scale.unsqueeze(-1)
+                return sA, sX, dt_sp
 
             D = self.D[:, None, ...].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
@@ -686,7 +691,7 @@ class BambaMixer(nn.Module):
 
             # 2-4. Fused kernel for conv1d, SSM, and the final projection
             if self.training and cache_params is None:
-                if "upi" in self.experiments.keys():
+                if "upi" in self.experiments:
                     if self.upi_dynamic:
                         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
                     else:
@@ -755,7 +760,7 @@ class BambaMixer(nn.Module):
                     dim=-1,
                 )
 
-                if "erf" in self.experiments.keys():
+                if "erf" in self.experiments:
                     mmd = mmd_ssd_full_chunk(
                         dt, 
                         A, 
@@ -766,7 +771,7 @@ class BambaMixer(nn.Module):
                         dt_limit=(0.0, float("inf"))
                         )
                     
-                if self.logits_rec and "logits" in self.experiments.keys(): # Save one set of logits for analysis
+                if self.logits_rec and "logits" in self.experiments: # Save one set of logits for analysis
                     with torch.no_grad():
                         curr_state = {}
                         curr_state['x'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim).cpu()
@@ -783,7 +788,7 @@ class BambaMixer(nn.Module):
 
                 dt_bias = self.dt_bias
                 dt_softplus = True
-                if "upi" in self.experiments.keys():
+                if "upi" in self.experiments:
                     # Precompute scaled delta and disable later ones
                     if self.upi_dynamic:
                         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
@@ -792,6 +797,9 @@ class BambaMixer(nn.Module):
                     dt = nn.functional.softplus(dt + self.dt_bias) / upi_mask
                     dt_bias = None
                     dt_softplus = False
+
+                if "proper_upi" in self.experiments:
+                    sA, sX, dt = scale_proper(self.proper_upi_scale, A, hidden_states, dt, dt_bias)
 
                 # 3. SSM transformation
                 scan_output, ssm_state = mamba_chunk_scan_combined(
@@ -886,7 +894,7 @@ class BambaMixer(nn.Module):
         # 3. SSM transformation
         A = -torch.exp(self.A_log.float()) 
 
-        # if "longmamba" in self.experiments.keys():
+        # if "longmamba" in self.experiments:
         #     # dt alignment
         #     params_for_debug = {}
         #     dt = nn.functional.softplus(dt + self.dt_bias)
@@ -977,12 +985,15 @@ class BambaMixer(nn.Module):
 
             dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
             
-            if "upi" in self.experiments.keys():
+            if "upi" in self.experiments:
                 if self.upi_dynamic:
                     upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
                 else:
                     upi_mask = self.upi_mask
                 dt = dt / upi_mask[:, None]
+            
+            if "proper_upi" in self.experiments:
+                A, X, dt_sp = scale_proper(scale, A, X, dt, dt_bias)
 
             dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
             A = A[..., None, None].expand(self.num_heads, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
@@ -1034,7 +1045,7 @@ class BambaMixer(nn.Module):
             # begin ssd naive implementation without einsums
             dt = nn.functional.softplus(dt + self.dt_bias)
             
-            if "upi" in self.experiments.keys():
+            if "upi" in self.experiments:
                 if self.upi_dynamic:
                     upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
                 else:
