@@ -170,3 +170,70 @@ def mmd_ssd_full_chunk(dt, A, B, C, chunk_size, dt_bias=None, dt_softplus=True, 
         del A, dt
         torch.cuda.empty_cache()
     return mmd / denom
+
+def state_mag_ssd_full_chunk(dt, A, B, x, chunk_size, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf")), device="cpu"):
+    with torch.no_grad():
+        if dt_bias is not None:
+            dt = dt + dt_bias
+        if dt_softplus:
+            dt = torch.nn.functional.softplus(dt)
+        if dt_limit:
+            dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
+
+        A = (A*dt).permute([0, 2, 1]) # (batch, nheads, seqlen)
+        
+        batch, nheads, seqlen = A.shape
+        num_chunks = -(-seqlen // chunk_size)
+
+        hidden_states = torch.zeros(batch, nheads, seqlen, device=torch.device("cpu"))
+        # denom = torch.zeros(batch, nheads, seqlen, device=torch.device("cpu"))
+        
+        for i in range(num_chunks):
+            i_start = i * chunk_size
+            i_end = min((i+1) * chunk_size, seqlen)
+            A_i_chunk = A[:, :, i_start:i_end].detach().to(device)
+
+            for j in range(num_chunks):
+                j_start = j * chunk_size
+                j_end = min((j+1) * chunk_size, seqlen)
+                B_chunk = B[:, j_start:j_end, :, :].detach().to(device) # (batch, chunk_size, ngroups, nheads)
+                dt_chunk = dt[:, j_start:j_end, :].detach().to(device) # (batch, chunk_size, nheads)
+                x_chunk = x[:, j_start:j_end, :, :].detach().to(device) # (batch, chunk_size, nheads, head_dim)
+
+                if i_start == j_start: # diagonal
+                    L_chunk = torch.exp(segment_sum(A_i_chunk))
+                elif i_start > j_start: # off-diagonal
+                    A_j_chunk = A[:, :, j_start:j_end].detach().to(device)
+                    A_mid = A[:, :, j_end:i_start].detach().to(device)
+
+                    A_C = torch.exp(torch.cumsum(A_i_chunk, dim=-1))
+                    A_B = torch.exp(torch.flip(torch.cumsum(torch.flip(A_j_chunk, [-1]), dim=-1), [-1]) - A_j_chunk)
+                    A_sum = torch.exp(torch.sum(A_mid, dim=-1)) # (batch, nheads)
+                    
+                    L_chunk = torch.einsum("bnl, bns, bn -> bnls", A_C, A_B, A_sum) # (batch, nheads, chunk_size, chunk_size)
+                    
+                    del A_C, A_B, A_sum, A_j_chunk, A_mid
+                else:
+                    del B_chunk, dt_chunk, x_chunk
+                    continue
+                
+                # Materialize chunked attention matrix
+                # H = torch.einsum("bsgn, bhls, bsh, bshd -> bshdgn", B_chunk, L_chunk, dt_chunk, x_chunk)
+                # H = torch.linalg.vector_norm(H, dim=(3, 4, 5)).permute(0, 2, 1).contiguous().detach().cpu()
+
+                Lsum = L_chunk.sum(dim=2)                 # [b,h,s_len]
+                F    = (dt_chunk * Lsum.permute(0,2,1))   # [b,s_len,h]
+                x_norm = torch.linalg.vector_norm(x_chunk, dim=-1)        # [b,s_len,h]
+                B_norm = torch.linalg.vector_norm(B_chunk, dim=(-2,-1))   # [b,s_len]
+                H = (F.abs() * x_norm * B_norm.unsqueeze(-1))             # [b,s_len,h]
+                H = H.permute(0,2,1).cpu()
+
+                hidden_states[:, :, i_start:i_end] += H
+                
+                del B_chunk, L_chunk, dt_chunk, x_chunk, H
+                torch.cuda.empty_cache()
+            del A_i_chunk
+            torch.cuda.empty_cache()
+        del A, dt
+        torch.cuda.empty_cache()
+    return hidden_states

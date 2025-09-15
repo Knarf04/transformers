@@ -17,6 +17,7 @@
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
+import os
 
 import torch
 import torch.utils.checkpoint
@@ -292,6 +293,12 @@ class Mamba2Mixer(nn.Module):
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
         self.use_bias = config.use_bias
 
+        self.experiments = getattr(config, "experiments", {}) 
+        
+        self.logits_reg = self.experiments.get("logits_reg", False)
+        self.logits_dir = self.experiments.get("logits_dir", "")
+        self.logits_num = 0
+
         if not is_fast_path_available:
             logger.warning_once(
                 "The fast path is not available because on of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
@@ -431,6 +438,23 @@ class Mamba2Mixer(nn.Module):
                     [self.intermediate_size, groups_time_state_size, groups_time_state_size],
                     dim=-1,
                 )
+
+                if self.logits_reg:
+                    with torch.no_grad():
+                        state_dict = {}
+                        state_dict['x'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim).cpu()
+                        state_dict['dt'] = dt.cpu()
+                        state_dict['A'] = A.cpu()
+                        state_dict['B'] = B.view(batch_size, seq_len, self.n_groups, -1).cpu()
+                        state_dict['C'] = C.view(batch_size, seq_len, self.n_groups, -1).cpu()
+                        state_dict['D'] = self.D.cpu()
+                        state_dict['dt_bias'] = self.dt_bias.cpu()
+
+                        logits_file = os.path.join(self.logits_dir, f'state_dict_sl={seq_len}_layer={self.layer_idx}_id={self.logits_num}.pt')
+                        torch.save(state_dict, logits_file)
+                        self.logits_num += 1
+                        if self.logits_num >= 100:
+                            self.logits_reg = False
 
                 # 3. SSM transformation
                 scan_output, ssm_state = mamba_chunk_scan_combined(
