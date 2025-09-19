@@ -355,6 +355,17 @@ class NemotronHMamba2Mixer(nn.Module):
         self.logits_dir = self.experiments.get("logits_dir", "")
         self.logits_num = 0
 
+        self.upi_dynamic = False # TODO: enable dynamic handling in config
+        self.seq_len = 0
+
+        self.proper_upi = self.experiments.get("proper_upi", False)
+        
+        self.scale = self.experiments.get("scale", 1)
+
+        self.adaptive_upi = self.experiments.get("adaptive_upi", False)
+        self.token_sig = self.experiments.get("token_sig", "softplus")
+        self.scale_portion = self.experiments.get("scale_portion", 0.95)
+
         if not is_fast_path_available:
             logger.warning_once(
                 "The fast path is not available because on of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
@@ -409,14 +420,58 @@ class NemotronHMamba2Mixer(nn.Module):
             A = A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
-
             D = self.D[:, None, ...].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
             C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
-            hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
+            hidden_states = hidden_states.view(batch_size, self.num_heads, self.head_dim)
+
+            dt_softplus = True
+
+            if self.proper_upi or self.adaptive_upi:
+                dtype = dt.dtype
+                dt = nn.functional.softplus((dt + dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
+                dt_bias = None
+                dt_softplus = False
+
+                # if "upi" in self.experiments:
+                #     if self.upi_dynamic:
+                #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                #     else:
+                #         upi_mask = self.upi_mask                    
+                #     dt_d = dt_d / upi_mask[:, None]
+                    
+                if self.proper_upi:
+                    # Dynamic upi scale is only possible with a cache of size O(seq_len)
+                    dtype = hidden_states.dtype
+                    hidden_states_scale = torch.expm1(self.scale * A * dt) / torch.expm1(A * dt)
+                    A = A * self.scale 
+                    hidden_states = (hidden_states * hidden_states_scale).to(dtype=dtype)
+
+                elif self.adaptive_upi:
+                    # Dynamic upi scale is only possible with a cache of size O(seq_len)
+                    token_sig = self.scale
+                    if self.token_sig == "forget":
+                        # 1) forget: 1-exp(-a*delta)
+                        token_sig = token_sig * (-torch.expm1(A * dt)) 
+                    elif self.token_sig == "sigmoid":
+                        # 2) sigmoid: 1-exp(-delta)
+                        token_sig = token_sig * (-torch.expm1(dt)) 
+                    elif self.token_sig == "input":
+                        # 3) input: delta*B
+                        B_norm = torch.linalg.norm(B.view(batch_size, -1), dim=-1, keepdim=True)
+                        token_sig = token_sig * dt * B_norm.unsqueeze(-1)
+                    elif self.token_sig == "softplus":
+                        # 4) softplus: delta
+                        token_sig = token_sig * dt
+
+                    dtype = hidden_states.dtype
+                    hidden_states_scale = torch.expm1(token_sig * A * dt) / (token_sig * torch.expm1(A * dt))
+                    hidden_states = (hidden_states * hidden_states_scale).to(dtype=dtype)
+                    dt = dt * token_sig
+
             hidden_states = selective_state_update(
                 cache_params.ssm_states[self.layer_idx],
-                hidden_states_reshaped,
+                hidden_states,
                 dt,
                 A,
                 B,
@@ -424,7 +479,7 @@ class NemotronHMamba2Mixer(nn.Module):
                 D,
                 z=None,
                 dt_bias=dt_bias,
-                dt_softplus=True,
+                dt_softplus=dt_softplus,
             )
             hidden_states = hidden_states.view(batch_size, self.num_heads * self.head_dim)
             hidden_states = self.norm(hidden_states, gate)
@@ -511,93 +566,58 @@ class NemotronHMamba2Mixer(nn.Module):
                         logits_file = os.path.join(self.logits_dir, f'state_dict_sl={seq_len}_layer={self.layer_idx}_id={self.logits_num}.pt')
                         torch.save(state_dict, logits_file)
                         self.logits_num += 1
-                        if self.logits_num >= 100:
+                        if self.logits_num >= 5:
                             self.logits_reg = False
-
+                
+                hidden_states = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
                 dt_bias = self.dt_bias
                 dt_softplus = True
 
-                # if "longmamba" in self.exp_type.keys():
-                #     # dt alignment
-                #     params_for_debug = {}
-                #     dt = nn.functional.softplus(dt + self.dt_bias)
-                #     if False:
-                #     # if merge_config is not None and merge_config['model_arch'] == "ours" and int(self.seq_len/1e3) > 2:
-                #         channel_threshold = merge_config['c']
-                #         tA_prod_path = f"./artifacts/{merge_config['align_path']}/tA_prod/tA_prod_layer_{self.layer_idx}.pt"
-                #         alpha_path = f"./artifacts/{merge_config['align_path']}/alpha/alpha_layer_{self.layer_idx}.pt"
-                #         decay_path = f"./artifacts/{merge_config['align_path']}/decay/decay_layer_{self.layer_idx}.pt"
-                #         dt_thre_path = f"./artifacts/{merge_config['align_path']}/delta_t-thre/delta_t-thre_layer_{self.layer_idx}.pt"
-                #         tA_prod = torch.load(tA_prod_path, map_location=dt.device)
-                #         self.channel_mask = tA_prod > channel_threshold
-                #         whether_mask = self.channel_mask.sum() != 0
-                #         available_values = []
-                #         if merge_config['our_method'] in ["alpha", "offline"]:
-                #             alpha_all = torch.load(alpha_path, map_location=dt.device)
-                #             for k in alpha_all:
-                #                 available_values.append(int(k[:-1])*1e3)
-                #         elif merge_config['our_method'] in ["bound", "norm"]:  
-                #             decay = torch.load(decay_path, map_location=dt.device)
-                #         elif merge_config['our_method'] in ["dt_thre"]:
-                #             dt_thre_all = torch.load(dt_thre_path, map_location=dt.device)
-                #             for k in dt_thre_all:
-                #                 available_values.append(int(k[:-1])*1e3)
-                            
-                #         self.slow_factor = 0
-                #         self.topk = 2000
-                #         dt = rearrange(dt, "b l h -> b h l")
-                #         if merge_config['our_method'] == "channelwise_topk" and whether_mask:
-                #             topk_mask = get_topk_mask_channelwise(delta_t=dt[:, self.channel_mask], k=self.topk)
-                #             dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
-                #         elif merge_config['our_method'] == "all_topk" and whether_mask:
-                #             topk_indice = get_top_k_token_indices(dt[:, self.channel_mask], k=self.topk)
-                #             topk_mask = torch.zeros_like(dt[:, self.channel_mask], dtype=torch.bool)
-                #             topk_mask[:,:,topk_indice] = True
-                #             dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
-                #         elif whether_mask and merge_config['b'] != 0:
-                #             key_num = int(min(available_values, key=lambda x: abs(self.seqlen - x))/1e3) if available_values != [] else None
-                #             if "alpha" in merge_config['our_method']:
-                #                 channel_alpha = alpha_all[f"{key_num}k"].to(dt.device)
-                #                 topk_mask = get_channelwise_topAlpha(delta_t=dt[:, self.channel_mask], alpha=channel_alpha[self.channel_mask]*merge_config['b'])
-                #                 dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
-                #             elif "offline" in merge_config['our_method']:
-                #                 key_num_offline = int(min(available_values, key=lambda x: abs(self.seqlen - x))/1e3)
-                #                 channel_alpha = alpha_all[f"{key_num_offline}k"].to(dt.device)
-                #                 topk_mask, _ = get_channelwise_offline(delta_t=dt[:, self.channel_mask], alpha=channel_alpha[self.channel_mask]*merge_config['b'])
-                #                 dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
-                #             elif "bound" in merge_config['our_method']:
-                #                 topk_mask = get_channelwise_topBound(delta_t=dt[:, self.channel_mask], decay=decay[self.channel_mask]*merge_config['b'])
-                #                 dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
-                #             elif "norm" in merge_config['our_method']:
-                #                 dt_norm = get_channelwise_normalize(delta_t=dt[:, self.channel_mask], decay=decay[self.channel_mask]*merge_config['b'])
-                #                 dt[:, self.channel_mask] = dt_norm
-                #             elif "dt_thre" in merge_config['our_method']:
-                #                 channel_dt_thre_all = dt_thre_all[f"{key_num}k"].to(dt.device)
-                #                 # self.dt_thre[f"layer_{self.layer_idx}"] = channel_dt_thre_all
-                #                 topk_mask = get_channelwise_dt_threshold(delta_t=dt[:, self.channel_mask], dt_thre=channel_dt_thre_all[self.channel_mask]*merge_config['b'])
-                #                 dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
-                #         else:
-                #             if whether_mask:
-                #                 print("Warning: no method is applied")
-                #             dt[:, self.channel_mask] = dt[:, self.channel_mask] * 0
-                #         dt = rearrange(dt, "b h l -> b l h")
-                #     if merge_config['save_para4debug']:
-                #         params_for_debug['A'] = A.clone().cpu()
-                #         params_for_debug['Sb_x'] = B.clone().cpu()  # B before discretization
-                #         params_for_debug['C'] = C.clone().cpu()
-                #         params_for_debug['delta_t'] = dt.clone().cpu()
-                #         print("Save parameters mamba2 debug")
-                #         params_for_debug['B_t'] = None
+                # if "upi" in self.experiments or self.proper_upi or self.adaptive_upi:
+                if self.proper_upi or self.adaptive_upi:
+                    dtype = dt.dtype
+                    dt = nn.functional.softplus((dt + self.dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
+                    dt_bias = None
+                    dt_softplus = False
+
+                    # if "upi" in self.experiments:
+                    #     if self.upi_dynamic:
+                    #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                    #     else:
+                    #         upi_mask = self.upi_mask                    
+                    #     dt_p = dt_p / upi_mask
+                        
+                    if self.proper_upi:
+                        dtype = hidden_states.dtype
+                        hidden_states_scale = torch.expm1(A * self.scale * dt) / torch.expm1(A * dt)
+                        hidden_states = hidden_states * hidden_states_scale.unsqueeze(-1)
+                        hidden_states = hidden_states.to(dtype=dtype)
                     
-                #     dt_bias = None
-                #     dt_softplus = False
-                #     # Change params_for_debug from outputing to saving to log file
-                #     with open(self.exp_type["longmamba"], 'a') as f:
-                #         f.write(json.dumps(params_for_debug) + '\n')
+                    elif self.adaptive_upi:
+                        # Dynamic upi scale is only possible with a cache of size O(seq_len)
+                        token_sig = self.scale
+                        if self.token_sig == "forget":
+                            # 1) forget: 1-exp(-a*delta)
+                            token_sig = token_sig * (-torch.expm1(A * dt)) 
+                        elif self.token_sig == "sigmoid":
+                            # 2) sigmoid: 1-exp(-delta)
+                            token_sig = token_sig * (-torch.expm1(dt)) 
+                        elif self.token_sig == "input":
+                            # 3) input: delta*B
+                            B_norm = torch.linalg.norm(B.view(batch_size, seq_len, -1), dim=-1, keepdim=True)
+                            token_sig = token_sig * dt * B_norm
+                        elif self.token_sig == "softplus":
+                            # 4) softplus: delta
+                            token_sig = token_sig * dt
+
+                        dtype = hidden_states.dtype
+                        hidden_states_scale = torch.expm1(token_sig * A * dt) / (token_sig * torch.expm1(A * dt))
+                        hidden_states = (hidden_states * hidden_states_scale.unsqueeze(-1)).to(dtype=dtype)
+                        dt = dt * token_sig
 
                 # 3. SSM transformation
                 scan_output, ssm_state = mamba_chunk_scan_combined(
-                    hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+                    hidden_states,
                     dt,
                     A,
                     B.view(batch_size, seq_len, self.n_groups, -1),
@@ -686,7 +706,7 @@ class NemotronHMamba2Mixer(nn.Module):
                 logits_file = os.path.join(self.logits_dir, f'state_dict_sl={seq_len}_layer={self.layer_idx}_id={self.logits_num}.pt')
                 torch.save(state_dict, logits_file)
                 self.logits_num += 1
-                if self.logits_num >= 100:
+                if self.logits_num >= 5:
                     self.logits_reg = False
 
         dt_bias = self.dt_bias
@@ -1180,7 +1200,7 @@ class NemotronHAttention(nn.Module):
                 logits_file = os.path.join(self.logits_dir, f'state_dict_sl={q_len}_layer={self.layer_idx}_id={self.logits_num}.pt')
                 torch.save(state_dict, logits_file)
                 self.logits_num += 1
-                if self.logits_num >= 100:
+                if self.logits_num >= 5:
                     self.logits_reg = False
 
         attn_output, attn_weights = attention_interface(

@@ -378,7 +378,7 @@ class BambaAttention(nn.Module):
                 logits_file = os.path.join(self.logits_dir, f'state_dict_sl={hidden_shape[1]}_layer={self.layer_idx}_id={self.logits_num}.pt')
                 torch.save(state_dict, logits_file)
                 self.logits_num += 1
-                if self.logits_num >= 100:
+                if self.logits_num >= 5:
                     self.logits_reg = False
 
         attn_weights = None
@@ -638,25 +638,58 @@ class BambaMixer(nn.Module):
             A = A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
-
-            dt_softplus = True
-            # if "upi" in self.experiments:
-            #     # Precompute scaled delta and disable later ones
-            #     if self.upi_dynamic:
-            #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
-            #     else:
-            #         upi_mask = self.upi_mask
-            #     dt = nn.functional.softplus(dt + dt_bias) / upi_mask[:, None]
-            #     dt_bias = None
-            #     dt_softplus = False
-
             D = self.D[:, None, ...].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
             C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
-            hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
+            hidden_states = hidden_states.view(batch_size, self.num_heads, self.head_dim)
+
+            dt_softplus = True
+
+            if self.proper_upi or self.adaptive_upi:
+                dtype = dt.dtype
+                dt = nn.functional.softplus((dt + dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
+                dt_bias = None
+                dt_softplus = False
+
+                # if "upi" in self.experiments:
+                #     if self.upi_dynamic:
+                #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                #     else:
+                #         upi_mask = self.upi_mask                    
+                #     dt_d = dt_d / upi_mask[:, None]
+                    
+                if self.proper_upi:
+                    # Dynamic upi scale is only possible with a cache of size O(seq_len)
+                    dtype = hidden_states.dtype
+                    hidden_states_scale = torch.expm1(self.scale * A * dt) / torch.expm1(A * dt)
+                    A = A * self.scale 
+                    hidden_states = (hidden_states * hidden_states_scale).to(dtype=dtype)
+
+                elif self.adaptive_upi:
+                    # Dynamic upi scale is only possible with a cache of size O(seq_len)
+                    token_sig = self.scale
+                    if self.token_sig == "forget":
+                        # 1) forget: 1-exp(-a*delta)
+                        token_sig = token_sig * (-torch.expm1(A * dt)) 
+                    elif self.token_sig == "sigmoid":
+                        # 2) sigmoid: 1-exp(-delta)
+                        token_sig = token_sig * (-torch.expm1(dt)) 
+                    elif self.token_sig == "input":
+                        # 3) input: delta*B
+                        B_norm = torch.linalg.norm(B.view(batch_size, -1), dim=-1, keepdim=True)
+                        token_sig = token_sig * dt * B_norm.unsqueeze(-1)
+                    elif self.token_sig == "softplus":
+                        # 4) softplus: delta
+                        token_sig = token_sig * dt
+
+                    dtype = hidden_states.dtype
+                    hidden_states_scale = torch.expm1(token_sig * A * dt) / (token_sig * torch.expm1(A * dt))
+                    hidden_states = (hidden_states * hidden_states_scale).to(dtype=dtype)
+                    dt = dt * token_sig
+
             hidden_states = selective_state_update(
                 cache_params.ssm_states[self.layer_idx],
-                hidden_states_reshaped,
+                hidden_states,
                 dt,
                 A,
                 B,
@@ -763,27 +796,58 @@ class BambaMixer(nn.Module):
                         logits_file = os.path.join(self.logits_dir, f'state_dict_sl={seq_len}_layer={self.layer_idx}_id={self.logits_num}.pt')
                         torch.save(state_dict, logits_file)
                         self.logits_num += 1
-                        if self.logits_num >= 100:
+                        if self.logits_num >= 5:
                             self.logits_reg = False
 
+                hidden_states = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
                 dt_bias = self.dt_bias
                 dt_softplus = True
-                # if "upi" in self.experiments:
-                #     # Precompute scaled delta and disable later ones
-                #     if self.upi_dynamic:
-                #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
-                #     else:
-                #         upi_mask = self.upi_mask                    
-                #     dt = nn.functional.softplus(dt + self.dt_bias) / upi_mask
-                #     dt_bias = None
-                #     dt_softplus = False
 
-                # if "proper_upi" in self.experiments:
-                #     sA, sX, dt = scale_proper(self.proper_upi_scale, A, hidden_states, dt, dt_bias)
+                # if "upi" in self.experiments or self.proper_upi or self.adaptive_upi:
+                if self.proper_upi or self.adaptive_upi:
+                    dtype = dt.dtype
+                    dt = nn.functional.softplus((dt + self.dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
+                    dt_bias = None
+                    dt_softplus = False
+
+                    # if "upi" in self.experiments:
+                    #     if self.upi_dynamic:
+                    #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                    #     else:
+                    #         upi_mask = self.upi_mask                    
+                    #     dt_p = dt_p / upi_mask
+                        
+                    if self.proper_upi:
+                        dtype = hidden_states.dtype
+                        hidden_states_scale = torch.expm1(A * self.scale * dt) / torch.expm1(A * dt)
+                        hidden_states = hidden_states * hidden_states_scale.unsqueeze(-1)
+                        hidden_states = hidden_states.to(dtype=dtype)
+                    
+                    elif self.adaptive_upi:
+                        # Dynamic upi scale is only possible with a cache of size O(seq_len)
+                        token_sig = self.scale
+                        if self.token_sig == "forget":
+                            # 1) forget: 1-exp(-a*delta)
+                            token_sig = token_sig * (-torch.expm1(A * dt)) 
+                        elif self.token_sig == "sigmoid":
+                            # 2) sigmoid: 1-exp(-delta)
+                            token_sig = token_sig * (-torch.expm1(dt)) 
+                        elif self.token_sig == "input":
+                            # 3) input: delta*B
+                            B_norm = torch.linalg.norm(B.view(batch_size, seq_len, -1), dim=-1, keepdim=True)
+                            token_sig = token_sig * dt * B_norm
+                        elif self.token_sig == "softplus":
+                            # 4) softplus: delta
+                            token_sig = token_sig * dt
+
+                        dtype = hidden_states.dtype
+                        hidden_states_scale = torch.expm1(token_sig * A * dt) / (token_sig * torch.expm1(A * dt))
+                        hidden_states = (hidden_states * hidden_states_scale.unsqueeze(-1)).to(dtype=dtype)
+                        dt = dt * token_sig
 
                 # 3. SSM transformation
                 scan_output, ssm_state = mamba_chunk_scan_combined(
-                    hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+                    hidden_states,
                     dt,
                     A,
                     B.view(batch_size, seq_len, self.n_groups, -1),
