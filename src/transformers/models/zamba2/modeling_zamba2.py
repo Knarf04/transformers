@@ -843,11 +843,6 @@ class Zamba2MambaMixer(nn.Module):
                 dt_bias = self.dt_bias
                 dt_softplus = True
 
-                if attention_mask is not None and not torch.all(attention_mask == 1):
-                    # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
-                    dtype = hidden_states.dtype
-                    hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
-
                 if self.logits_reg:
                     with torch.no_grad():
                         state_dict = {}
@@ -910,6 +905,11 @@ class Zamba2MambaMixer(nn.Module):
                         hidden_states_scale = torch.expm1(token_sig * A * dt) / (token_sig * torch.expm1(A * dt))
                         hidden_states = (hidden_states * hidden_states_scale.unsqueeze(-1)).to(dtype=dtype)
                         dt = dt * token_sig
+
+                if attention_mask is not None and not torch.all(attention_mask == 1):
+                    # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
+                    dtype = hidden_states.dtype
+                    hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
 
                 scan_output, ssm_state = mamba_chunk_scan_combined(
                     hidden_states,
