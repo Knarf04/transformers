@@ -518,7 +518,9 @@ class Mamba2Mixer(nn.Module):
                             self.logits_reg = False
 
                 if self.mmd:
-                    mmd = mmd_ssd_last(dt, A, B, C, dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
+                    B_view = B.view(batch_size, seq_len, self.n_groups, -1)
+                    C_view = C.view(batch_size, seq_len, self.n_groups, -1)
+                    mmd = mmd_ssd_last(dt, A, B_view, C_view, dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
                     record = {
                         "layer_idx": self.layer_idx,
                         "seq_len": self.seq_len,
