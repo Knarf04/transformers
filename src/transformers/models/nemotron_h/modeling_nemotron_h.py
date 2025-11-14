@@ -581,7 +581,7 @@ class NemotronHMamba2Mixer(nn.Module):
                         "dt": dt_sp.tolist(),
                         "forget": forget.tolist()
                         }
-                    filename = "/gpfs/hshen/mmd/mamba2.jsonl"
+                    filename = "/gpfs/hshen/mmd/nemotronh.jsonl"
                     os.makedirs(os.path.dirname(filename), exist_ok=True)
                     with open(filename, "a", encoding="utf-8") as f:
                         f.write(json.dumps(record) + '\n')
