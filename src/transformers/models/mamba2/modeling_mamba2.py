@@ -18,6 +18,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Union
 import os
+import json
 
 import torch
 from torch import nn
@@ -33,7 +34,7 @@ from ...utils import (
 )
 from ...utils.import_utils import is_causal_conv1d_available, is_mamba_2_ssm_available
 from .configuration_mamba2 import Mamba2Config
-
+from ...analysis.mmd import mmd_ssd_last, mmd_ssd_full_chunk
 
 logger = logging.get_logger(__name__)
 
@@ -303,6 +304,8 @@ class Mamba2Mixer(nn.Module):
         self.token_sig = self.experiments.get("token_sig", "softplus")
         self.scale_portion = self.experiments.get("scale_portion", 0.95)
 
+        self.mmd = self.experiments.get("mmd", False)
+        
         if not is_fast_path_available:
             logger.warning_once(
                 "The fast path is not available because one of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
@@ -504,6 +507,18 @@ class Mamba2Mixer(nn.Module):
                         self.logits_num += 1
                         if self.logits_num >= 5:
                             self.logits_reg = False
+
+                if self.mmd:
+                    mmd = mmd_ssd_last(dt, A, B, C, dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
+                    record = {
+                        "layer_idx": self.layer_idx,
+                        "seq_len": self.seq_len,
+                        "erf": mmd.tolist()
+                        }
+                    filename = "/gpfs/hshen/mmd/mamba2.jsonl"
+                    os.makedirs(os.path.dirname(filename), exist_ok=True)
+                    with open(filename, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(record) + '\n')
 
                 hidden_states = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
                 dt_bias = self.dt_bias
