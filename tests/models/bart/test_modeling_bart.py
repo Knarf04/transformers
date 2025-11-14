@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021, The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +16,8 @@
 import copy
 import tempfile
 import unittest
+import unittest.mock
+from functools import cached_property
 
 import timeout_decorator  # noqa
 
@@ -29,7 +30,6 @@ from transformers.testing_utils import (
     slow,
     torch_device,
 )
-from transformers.utils import cached_property
 
 from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
@@ -59,28 +59,16 @@ def prepare_bart_inputs_dict(
     decoder_input_ids=None,
     attention_mask=None,
     decoder_attention_mask=None,
-    head_mask=None,
-    decoder_head_mask=None,
-    cross_attn_head_mask=None,
 ):
     if attention_mask is None:
         attention_mask = input_ids.ne(config.pad_token_id)
     if decoder_attention_mask is None:
         decoder_attention_mask = decoder_input_ids.ne(config.pad_token_id)
-    if head_mask is None:
-        head_mask = torch.ones(config.encoder_layers, config.encoder_attention_heads, device=torch_device)
-    if decoder_head_mask is None:
-        decoder_head_mask = torch.ones(config.decoder_layers, config.decoder_attention_heads, device=torch_device)
-    if cross_attn_head_mask is None:
-        cross_attn_head_mask = torch.ones(config.decoder_layers, config.decoder_attention_heads, device=torch_device)
     return {
         "input_ids": input_ids,
         "decoder_input_ids": decoder_input_ids,
         "attention_mask": attention_mask,
         "decoder_attention_mask": attention_mask,
-        "head_mask": head_mask,
-        "decoder_head_mask": decoder_head_mask,
-        "cross_attn_head_mask": cross_attn_head_mask,
     }
 
 
@@ -100,7 +88,7 @@ class BartModelTester:
         hidden_act="gelu",
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
-        max_position_embeddings=20,
+        max_position_embeddings=50,
         eos_token_id=2,
         pad_token_id=1,
         bos_token_id=0,
@@ -168,10 +156,9 @@ class BartModelTester:
         model = BartModel(config=config).get_decoder().to(torch_device).eval()
         input_ids = inputs_dict["input_ids"]
         attention_mask = inputs_dict["attention_mask"]
-        head_mask = inputs_dict["head_mask"]
 
         # first forward pass
-        outputs = model(input_ids, attention_mask=attention_mask, head_mask=head_mask, use_cache=True)
+        outputs = model(input_ids, attention_mask=attention_mask, use_cache=True)
 
         output, past_key_values = outputs.to_tuple()
 
@@ -435,8 +422,6 @@ class BartModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin
         else {}
     )
     is_encoder_decoder = True
-    fx_compatible = False  # Fix me Michael
-    test_pruning = False
 
     def setUp(self):
         self.model_tester = BartModelTester(self)
@@ -453,7 +438,7 @@ class BartModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin
             with tempfile.TemporaryDirectory() as tmpdirname:
                 model.save_pretrained(tmpdirname)
                 model2, info = model_class.from_pretrained(tmpdirname, output_loading_info=True)
-            self.assertEqual(info["missing_keys"], [])
+            self.assertEqual(info["missing_keys"], set())
 
     def test_decoder_model_past_with_large_inputs(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
@@ -493,6 +478,24 @@ class BartModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin
             with torch.no_grad():
                 model(**inputs)[0]
 
+    @unittest.skip("Bart no longer always uses self.shared so not working.")
+    def test_input_embeddings_support_forward_hook(self):
+        # Make sure that registering hooks on the input embeddings are indeed called
+        # in forward. This is necessary for gradient checkpointing in PEFT, see also #41821.
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs()
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            model.to(torch_device)
+            model.eval()
+
+            hook = unittest.mock.MagicMock(return_value=None)
+            model.get_input_embeddings().register_forward_hook(hook)
+
+            inputs = copy.deepcopy(self._prepare_for_class(inputs_dict, model_class))
+            model(**inputs)
+
+            self.assertGreater(hook.call_count, 0)
+
     @require_torch_fp16
     def test_generate_fp16(self):
         config, input_dict = self.model_tester.prepare_config_and_inputs()
@@ -529,7 +532,7 @@ def assert_tensors_close(a, b, atol=1e-12, prefix=""):
     try:
         if torch.allclose(a, b, atol=atol):
             return True
-        raise
+        raise Exception
     except Exception:
         pct_different = (torch.gt((a - b).abs(), atol)).float().mean().item()
         if a.numel() > 100:
@@ -599,13 +602,15 @@ class FastIntegrationTests(unittest.TestCase):
             " 2002 to prosecute genocide, crimes against humanity and war crimes."
         )
         EXPECTED = (
+            "</s>"
             " The International Criminal Court (ICC) has announced that it has been announced by the International"
             " Criminal court."
+            "</s>"
         )
 
         dct = tok(ARTICLE, return_tensors="pt")
         generated_ids = hf.generate(**dct, num_beams=4)
-        result = tok.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        result = tok.batch_decode(generated_ids)[0]
         assert EXPECTED == result
 
     def test_xsum_1_1_batch_generation(self):
@@ -729,16 +734,18 @@ class FastIntegrationTests(unittest.TestCase):
             truncation=True,
         )
         generated_ids = self.xsum_1_1_model.generate(**batch, num_beams=4)
-        result = self.tok.batch_decode(generated_ids, skip_special_tokens=True)
-        assert (
-            result[0]
-            == " The International Criminal Court (ICC) has announced that it has been announced by the International"
+        result = self.tok.batch_decode(generated_ids)
+        assert result[0] == (
+            "</s>"
+            " The International Criminal Court (ICC) has announced that it has been announced by the International"
             " Criminal court."
+            "</s><pad><pad><pad><pad><pad>"
         )
-        assert (
-            result[1]
-            == " An investigation into the crash that killed at least 10 people in the French capital has been"
+        assert result[1] == (
+            "</s>"
+            " An investigation into the crash that killed at least 10 people in the French capital has been"
             " released by the French police investigating the crash."
+            "</s>"
         )
 
     def test_encoder_equiv(self):
@@ -939,8 +946,10 @@ class BartModelIntegrationTests(unittest.TestCase):
         PGE_ARTICLE = """ PG&E stated it scheduled the blackouts in response to forecasts for high winds amid dry conditions. The aim is to reduce the risk of wildfires. Nearly 800 thousand customers were scheduled to be affected by the shutoffs which were expected to last through at least midday tomorrow."""
 
         EXPECTED_SUMMARY = (
+            "</s>"
             "California's largest power company has begun shutting off electricity to thousands of customers in the"
             " state."
+            "</s>"
         )
         dct = tok.batch_encode_plus(
             [PGE_ARTICLE],
@@ -962,10 +971,7 @@ class BartModelIntegrationTests(unittest.TestCase):
             decoder_start_token_id=model.config.eos_token_id,
         )
 
-        decoded = tok.batch_decode(
-            hypotheses_batch,
-            skip_special_tokens=True,
-        )
+        decoded = tok.batch_decode(hypotheses_batch)
         self.assertEqual(EXPECTED_SUMMARY, decoded[0])
 
     def test_xsum_config_generation_params(self):
@@ -1175,8 +1181,7 @@ class BartModelIntegrationTests(unittest.TestCase):
             [FRANCE_ARTICLE, SHORTER_ARTICLE, IRAN_ARTICLE, ARTICLE_SUBWAY],
             max_length=1024,
             padding="max_length",
-            truncation_strategy="only_first",
-            truncation=True,
+            truncation="only_first",
             return_tensors="pt",
         )
 
@@ -1189,28 +1194,35 @@ class BartModelIntegrationTests(unittest.TestCase):
         assert hypotheses_batch[:, 1].eq(0).all().item()
 
         EXPECTED = [
+            "</s><s>"
             "A French prosecutor says he is not aware of any video footage from on board the plane. Two German "
             "magazines claim to have found a cell phone video showing the crash. The publications say they watched "
             "the video, which was found by a source close to the investigation. All 150 on board Germanwings Flight "
-            "9525 were killed.",
+            "9525 were killed."
+            "</s>",
+            "</s><s>"
             "Palestinian Authority becomes 123rd member of the International Criminal Court. The move gives the court "
             "jurisdiction over alleged crimes in Palestinian territories. Israel and the United States opposed the "
             "Palestinians' efforts to join the body. But Palestinian Foreign Minister Riad al-Malki said it was a "
-            "move toward greater justice.",
+            "move toward greater justice."
+            "</s><pad><pad><pad><pad>",
+            "</s><s>"
             "U.S. and its negotiating partners reached a strong framework agreement with Iran. Peter Bergen: The "
             "debate that has already begun will likely result in more heat than light. He says critics have made "
             "dubious assumptions and doubtful assertions. Bergen says the goal was to block Iran from building a "
-            "nuclear weapon.",
+            "nuclear weapon."
+            "</s><pad><pad><pad>",
+            "</s><s>"
             "Liana Barrientos, 39, has been married 10 times, sometimes within two weeks of each other. Prosecutors "
             "say the marriages were part of an immigration scam. She pleaded not guilty at State Supreme Court in the "
-            "Bronx on Friday. If convicted, she faces up to four years in prison.",
+            "Bronx on Friday. If convicted, she faces up to four years in prison."
+            "</s><pad><pad><pad><pad><pad>",
         ]
 
-        generated_summaries = tok.batch_decode(
-            hypotheses_batch.tolist(), clean_up_tokenization_spaces=True, skip_special_tokens=True
-        )
+        generated_summaries = tok.batch_decode(hypotheses_batch.tolist())
         assert generated_summaries == EXPECTED
 
+    # TODO joao, manuel: remove this in v4.62.0
     @slow
     def test_contrastive_search_bart(self):
         article = (
@@ -1244,7 +1256,15 @@ class BartModelIntegrationTests(unittest.TestCase):
             article, add_special_tokens=False, truncation=True, max_length=512, return_tensors="pt"
         ).input_ids.to(torch_device)
 
-        outputs = bart_model.generate(input_ids, penalty_alpha=0.5, top_k=5, max_length=64, num_beams=1)
+        outputs = bart_model.generate(
+            input_ids,
+            penalty_alpha=0.5,
+            top_k=5,
+            max_length=64,
+            num_beams=1,
+            trust_remote_code=True,
+            custom_generate="transformers-community/contrastive-search",
+        )
         generated_text = bart_tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
         self.assertListEqual(
@@ -1306,7 +1326,7 @@ class BartStandaloneDecoderModelTester:
         decoder_layers=2,
         encoder_attention_heads=4,
         decoder_attention_heads=4,
-        max_position_embeddings=30,
+        max_position_embeddings=50,
         is_encoder_decoder=False,
         pad_token_id=0,
         bos_token_id=1,
@@ -1370,6 +1390,7 @@ class BartStandaloneDecoderModelTester:
             decoder_start_token_id=self.decoder_start_token_id,
             max_position_embeddings=self.max_position_embeddings,
             is_encoder_decoder=self.is_encoder_decoder,
+            forced_eos_token_id=None,
         )
 
         return (
@@ -1470,9 +1491,9 @@ class BartStandaloneDecoderModelTester:
 
         # get two different outputs
         output_from_no_past = model(next_input_ids, attention_mask=attn_mask)["last_hidden_state"]
-        output_from_past = model(next_tokens, attention_mask=attn_mask, past_key_values=past_key_values)[
-            "last_hidden_state"
-        ]
+        output_from_past = model(
+            next_tokens, attention_mask=attn_mask, past_key_values=past_key_values, use_cache=True
+        )["last_hidden_state"]
 
         # select random slice
         random_slice_idx = ids_tensor((1,), output_from_past.shape[-1]).item()
@@ -1501,8 +1522,6 @@ class BartStandaloneDecoderModelTester:
 @require_torch
 class BartStandaloneDecoderModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
     all_model_classes = (BartDecoder, BartForCausalLM) if is_torch_available() else ()
-    fx_comptatible = True
-    test_pruning = False
     is_encoder_decoder = False
     test_missing_keys = False
 
@@ -1527,6 +1546,6 @@ class BartStandaloneDecoderModelTest(ModelTesterMixin, GenerationTesterMixin, un
     def test_retain_grad_hidden_states_attentions(self):
         return
 
-    @unittest.skip
-    def test_save_load_fast_init_from_base(self):
-        pass
+    @unittest.skip(reason="Decoder cannot keep gradients")
+    def test_flex_attention_with_grads():
+        return

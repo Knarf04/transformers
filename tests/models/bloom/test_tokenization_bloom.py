@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2022 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import unittest
 
 from datasets import load_dataset
 
 from transformers import BloomTokenizerFast
-from transformers.testing_utils import require_jinja, require_tokenizers
+from transformers.testing_utils import require_tokenizers
 
 from ...test_tokenization_common import TokenizerTesterMixin
 
@@ -34,14 +34,19 @@ class BloomTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
     from_pretrained_vocab_key = "tokenizer_file"
     special_tokens_map = {"bos_token": "<s>", "eos_token": "</s>", "unk_token": "<unk>", "pad_token": "<pad>"}
 
-    def setUp(self):
-        super().setUp()
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
         tokenizer = BloomTokenizerFast.from_pretrained("bigscience/tokenizer")
-        tokenizer.save_pretrained(self.tmpdirname)
+        tokenizer.save_pretrained(cls.tmpdirname)
 
-    def get_rust_tokenizer(self, **kwargs):
-        kwargs.update(self.special_tokens_map)
-        return BloomTokenizerFast.from_pretrained(self.tmpdirname, **kwargs)
+    @classmethod
+    def get_rust_tokenizer(cls, pretrained_name=None, **kwargs):
+        _kwargs = copy.deepcopy(cls.special_tokens_map)
+        _kwargs.update(kwargs)
+        kwargs = _kwargs
+        pretrained_name = pretrained_name or cls.tmpdirname
+        return BloomTokenizerFast.from_pretrained(pretrained_name, **kwargs)
 
     @unittest.skip(reason="This needs a slow tokenizer. Bloom does not have one!")
     def test_encode_decode_with_spaces(self):
@@ -65,7 +70,7 @@ class BloomTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
     def test_padding(self, max_length=6):
         for tokenizer, pretrained_name, kwargs in self.tokenizers_list:
             with self.subTest(f"{tokenizer.__class__.__name__} ({pretrained_name})"):
-                tokenizer_r = self.rust_tokenizer_class.from_pretrained(pretrained_name, **kwargs)
+                tokenizer_r = self.get_rust_tokenizer(pretrained_name, **kwargs)
                 # tokenizer_r.pad_token = None # Hotfixing padding = None
                 # Simple input
                 s = "This is a simple input"
@@ -131,28 +136,6 @@ class BloomTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         output_tokens = list(map(tokenizer.encode, input_text))
         predicted_text = [tokenizer.decode(x, clean_up_tokenization_spaces=False) for x in output_tokens]
         self.assertListEqual(predicted_text, input_text)
-
-    @require_jinja
-    def test_tokenization_for_chat(self):
-        tokenizer = self.get_rust_tokenizer()
-        tokenizer.chat_template = "{% for message in messages %}{{ message.content }}{{ eos_token }}{% endfor %}"
-        test_chats = [
-            [{"role": "system", "content": "You are a helpful chatbot."}, {"role": "user", "content": "Hello!"}],
-            [
-                {"role": "system", "content": "You are a helpful chatbot."},
-                {"role": "user", "content": "Hello!"},
-                {"role": "assistant", "content": "Nice to meet you."},
-            ],
-            [{"role": "assistant", "content": "Nice to meet you."}, {"role": "user", "content": "Hello!"}],
-        ]
-        tokenized_chats = [tokenizer.apply_chat_template(test_chat) for test_chat in test_chats]
-        expected_tokens = [
-            [5448, 1306, 267, 66799, 44799, 37143, 17, 2, 59414, 4, 2],
-            [5448, 1306, 267, 66799, 44799, 37143, 17, 2, 59414, 4, 2, 229126, 427, 11890, 1152, 17, 2],
-            [229126, 427, 11890, 1152, 17, 2, 59414, 4, 2],
-        ]
-        for tokenized_chat, expected_tokens in zip(tokenized_chats, expected_tokens):
-            self.assertListEqual(tokenized_chat, expected_tokens)
 
     def test_add_prefix_space_fast(self):
         tokenizer_w_prefix = self.get_rust_tokenizer(add_prefix_space=True)

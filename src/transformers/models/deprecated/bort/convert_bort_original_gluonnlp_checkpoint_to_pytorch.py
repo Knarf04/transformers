@@ -180,9 +180,9 @@ def convert_bort_checkpoint_to_pytorch(bort_checkpoint_path: str, pytorch_dump_f
         gluon_param = to_torch(params[gluon_param])
         shape_gluon = gluon_param.shape
 
-        assert (
-            shape_hf == shape_gluon
-        ), f"The gluon parameter {gluon_param} has shape {shape_gluon}, but expects shape {shape_hf} for Transformers"
+        assert shape_hf == shape_gluon, (
+            f"The gluon parameter {gluon_param} has shape {shape_gluon}, but expects shape {shape_hf} for Transformers"
+        )
 
         return gluon_param
 
@@ -299,9 +299,9 @@ def convert_bort_checkpoint_to_pytorch(bort_checkpoint_path: str, pytorch_dump_f
     success = np.allclose(gluon_layer, hf_layer, atol=1e-3)
 
     if success:
-        print("✔️ Both model do output the same tensors")
+        print("[SUCCESS] Both models do output the same tensors")
     else:
-        print("❌ Both model do **NOT** output the same tensors")
+        print("[FAIL] Both models do **NOT** output the same tensors")
         print("Absolute difference is:", max_absolute_diff)
 
 
