@@ -25,6 +25,7 @@ from typing import Any, Optional, TypedDict, Union
 import torch
 from torch import nn
 from torch.nn import functional as F
+import json
 
 from transformers.activations import ACT2FN
 
@@ -56,6 +57,11 @@ else:
 
 
 logger = logging.get_logger(__name__)
+
+import os
+from ...analysis.LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
+from ...analysis.mmd import mmd_gqa_last, mmd_ssd_last, mmd_ssd_full_chunk
+from ...analysis.upi import scale_dt, dynamic_scale_mask, scale_proper
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -121,6 +127,12 @@ class GraniteMoeHybridAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
+        
+        self.experiments = getattr(config, "experiments", {})
+        
+        self.logits_reg = self.experiments.get("logits_reg", False)
+        self.logits_dir = self.experiments.get("logits_dir", "")
+        self.logits_num = 0
 
     def forward(
         self,
@@ -144,6 +156,38 @@ class GraniteMoeHybridAttention(nn.Module):
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        # if "erf" in self.experiments:
+        #     mmd = mmd_from_gqa_inputs(query_states, key_states, attention_mask=attention_mask, scaling=self.scaling)
+        #     record = {
+        #         "layer_idx": self.layer_idx,
+        #         "seq_len": query_states.shape[2],
+        #         "erf": mmd.tolist()
+        #         }
+        #     with open(self.experiments["erf"], 'a') as f:
+        #         f.write(json.dumps(record) + '\n')
+        
+        # if "logits" in self.experiments:
+        #     state_dict = {}
+        #     state_dict['q'] = query_states
+        #     state_dict['k'] = key_states
+        #     state_dict['v'] = value_states
+        #     state_dict['mask'] = attention_mask
+        #     state_dict['scaling'] = self.scaling
+        #     torch.save(state_dict, os.path.join(self.experiments["logits"], f'state_dict_{query_states.shape[2]}_{self.layer_idx}.pt'))
+        if self.logits_reg:
+            with torch.no_grad():
+                state_dict = {}
+                state_dict['q'] = query_states
+                state_dict['k'] = key_states
+                state_dict['v'] = value_states
+                state_dict['mask'] = attention_mask
+                state_dict['scaling'] = self.scaling
+                logits_file = os.path.join(self.logits_dir, f'state_dict_sl={hidden_shape[1]}_layer={self.layer_idx}_id={self.logits_num}.pt')
+                torch.save(state_dict, logits_file)
+                self.logits_num += 1
+                if self.logits_num >= 5:
+                    self.logits_reg = False
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -408,6 +452,22 @@ class GraniteMoeHybridMambaLayer(nn.Module):
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=self.use_bias)
 
+        # Experiments
+        self.experiments = getattr(config, "experiments", {})
+        self.logits_reg = self.experiments.get("logits_reg", False)
+        self.logits_dir = self.experiments.get("logits_dir", "")
+        self.logits_num = 0
+
+        self.upi_dynamic = False # TODO: enable dynamic handling in config
+        self.seq_len = 0
+        self.proper_upi = self.experiments.get("proper_upi", False)
+        
+        self.scale = self.experiments.get("scale", 1)
+        self.adaptive_upi = self.experiments.get("adaptive_upi", False)
+        self.token_sig = self.experiments.get("token_sig", "softplus")
+        self.scale_portion = self.experiments.get("scale_portion", 0.95)
+        self.distribution_reg = self.experiments.get("distribution_reg", False)
+
         if not is_fast_path_available:
             logger.warning_once(
                 "The fast path is not available because one of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
@@ -446,6 +506,7 @@ class GraniteMoeHybridMambaLayer(nn.Module):
 
         # getting projected states from cache if it exists
         if use_precomputed_states:
+            self.seq_len += 1
             gate, hidden_states_B_C, dt = projected_states.squeeze(1).split(
                 [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
             )
@@ -473,10 +534,51 @@ class GraniteMoeHybridMambaLayer(nn.Module):
             D = self.D[:, None, ...].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
             C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
-            hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
+            hidden_states = hidden_states.view(batch_size, self.num_heads, self.head_dim)
+            
+            dt_softplus = True
+            if self.proper_upi or self.adaptive_upi:
+                dtype = dt.dtype
+                dt = nn.functional.softplus((dt + dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
+                dt_bias = None
+                dt_softplus = False
+                # if "upi" in self.experiments:
+                #     if self.upi_dynamic:
+                #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                #     else:
+                #         upi_mask = self.upi_mask                    
+                #     dt_d = dt_d / upi_mask[:, None]
+                    
+                if self.proper_upi:
+                    # Dynamic upi scale is only possible with a cache of size O(seq_len)
+                    dtype = hidden_states.dtype
+                    hidden_states_scale = torch.expm1(self.scale * A * dt) / torch.expm1(A * dt)
+                    A = A * self.scale
+                    hidden_states = (hidden_states * hidden_states_scale).to(dtype=dtype)
+                elif self.adaptive_upi:
+                    # Dynamic upi scale is only possible with a cache of size O(seq_len)
+                    token_sig = self.scale
+                    if self.token_sig == "forget":
+                        # 1) forget: 1-exp(-a*delta)
+                        token_sig = token_sig * (-torch.expm1(A * dt))
+                    elif self.token_sig == "sigmoid":
+                        # 2) sigmoid: 1-exp(-delta)
+                        token_sig = token_sig * (-torch.expm1(dt))
+                    elif self.token_sig == "input":
+                        # 3) input: delta*B
+                        B_norm = torch.linalg.norm(B.view(batch_size, -1), dim=-1, keepdim=True)
+                        token_sig = token_sig * dt * B_norm.unsqueeze(-1)
+                    elif self.token_sig == "softplus":
+                        # 4) softplus: delta
+                        token_sig = token_sig * dt
+                    dtype = hidden_states.dtype
+                    hidden_states_scale = torch.expm1(token_sig * A * dt) / (token_sig * torch.expm1(A * dt))
+                    hidden_states = (hidden_states * hidden_states_scale).to(dtype=dtype)
+                    dt = dt * token_sig
+
             hidden_states = selective_state_update(
                 cache_params.ssm_states[self.layer_idx],
-                hidden_states_reshaped,
+                hidden_states,
                 dt,
                 A,
                 B,
@@ -484,7 +586,7 @@ class GraniteMoeHybridMambaLayer(nn.Module):
                 D,
                 z=None,
                 dt_bias=dt_bias,
-                dt_softplus=True,
+                dt_softplus=dt_softplus,
             )
             hidden_states = hidden_states.view(batch_size, self.num_heads * self.head_dim)
             hidden_states = self.norm(hidden_states, gate)
@@ -493,11 +595,24 @@ class GraniteMoeHybridMambaLayer(nn.Module):
             out = self.out_proj(hidden_states)[:, None, ...]
         # Fused calculations or step by step if no initialized cache is found
         else:
+            # Record sequence length for dynamic scaling updates
+            self.seq_len = seq_len
             A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
             # 2-4. Fused kernel for conv1d, SSM, and the final projection
             if self.training and cache_params is None:
+                # if "upi" in self.experiments:
+                #     if self.upi_dynamic:
+                #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                #     else:
+                #         upi_mask = self.upi_mask
+                #     zxbc, dt = projected_states.split(
+                #         [self.intermediate_size + self.conv_dim, self.num_heads], dim=-1
+                #     )
+                #     dt = scale_dt(upi_mask, dt, self.dt_bias)
+                #     projected_states = torch.cat([zxbc, dt], dim=-1)
+
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
@@ -557,9 +672,81 @@ class GraniteMoeHybridMambaLayer(nn.Module):
                     dim=-1,
                 )
 
+                if self.logits_reg:
+                    with torch.no_grad():
+                        state_dict = {}
+                        state_dict['x'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim).cpu()
+                        state_dict['dt'] = dt.cpu()
+                        state_dict['A'] = A.cpu()
+                        state_dict['B'] = B.view(batch_size, seq_len, self.n_groups, -1).cpu()
+                        state_dict['C'] = C.view(batch_size, seq_len, self.n_groups, -1).cpu()
+                        state_dict['D'] = self.D.cpu()
+                        state_dict['dt_bias'] = self.dt_bias.cpu()
+                        logits_file = os.path.join(self.logits_dir, f'state_dict_sl={seq_len}_layer={self.layer_idx}_id={self.logits_num}.pt')
+                        torch.save(state_dict, logits_file)
+                        self.logits_num += 1
+                        if self.logits_num >= 5:
+                            self.logits_reg = False
+                if self.distribution_reg:
+                    # (batch, seqlen, nheads)
+                    dtype = dt.dtype
+                    dt_sp = nn.functional.softplus((dt + self.dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
+                    forget = torch.exp(A * dt_sp)
+                    record = {
+                        "layer_idx": self.layer_idx,
+                        "dt": dt_sp.tolist(),
+                        "forget": forget.tolist()
+                        }
+                    filename = "/gpfs/hshen/mmd/bamba2.jsonl"
+                    os.makedirs(os.path.dirname(filename), exist_ok=True)
+                    with open(filename, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(record) + '\n')
+                hidden_states = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
+                dt_bias = self.dt_bias
+                dt_softplus = True
+                # if "upi" in self.experiments or self.proper_upi or self.adaptive_upi:
+                if self.proper_upi or self.adaptive_upi:
+                    dtype = dt.dtype
+                    dt = nn.functional.softplus((dt + self.dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
+                    dt_bias = None
+                    dt_softplus = False
+                    # if "upi" in self.experiments:
+                    #     if self.upi_dynamic:
+                    #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+                    #     else:
+                    #         upi_mask = self.upi_mask                    
+                    #     dt_p = dt_p / upi_mask
+                        
+                    if self.proper_upi:
+                        dtype = hidden_states.dtype
+                        hidden_states_scale = torch.expm1(A * self.scale * dt) / torch.expm1(A * dt)
+                        hidden_states = hidden_states * hidden_states_scale.unsqueeze(-1)
+                        hidden_states = hidden_states.to(dtype=dtype)
+                    
+                    elif self.adaptive_upi:
+                        # Dynamic upi scale is only possible with a cache of size O(seq_len)
+                        token_sig = self.scale
+                        if self.token_sig == "forget":
+                            # 1) forget: 1-exp(-a*delta)
+                            token_sig = token_sig * (-torch.expm1(A * dt))
+                        elif self.token_sig == "sigmoid":
+                            # 2) sigmoid: 1-exp(-delta)
+                            token_sig = token_sig * (-torch.expm1(dt))
+                        elif self.token_sig == "input":
+                            # 3) input: delta*B
+                            B_norm = torch.linalg.norm(B.view(batch_size, seq_len, -1), dim=-1, keepdim=True)
+                            token_sig = token_sig * dt * B_norm
+                        elif self.token_sig == "softplus":
+                            # 4) softplus: delta
+                            token_sig = token_sig * dt
+                        dtype = hidden_states.dtype
+                        hidden_states_scale = torch.expm1(token_sig * A * dt) / (token_sig * torch.expm1(A * dt))
+                        hidden_states = (hidden_states * hidden_states_scale.unsqueeze(-1)).to(dtype=dtype)
+                        dt = dt * token_sig
+
                 # 3. SSM transformation
                 scan_output, ssm_state = mamba_chunk_scan_combined(
-                    hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+                    hidden_states,
                     dt,
                     A,
                     B.view(batch_size, seq_len, self.n_groups, -1),
@@ -569,8 +756,8 @@ class GraniteMoeHybridMambaLayer(nn.Module):
                     z=None,
                     seq_idx=seq_idx,
                     return_final_states=True,
-                    dt_bias=self.dt_bias,
-                    dt_softplus=True,
+                    dt_bias=dt_bias,
+                    dt_softplus=dt_softplus,
                     **dt_limit_kwargs,
                 )
 
@@ -649,7 +836,85 @@ class GraniteMoeHybridMambaLayer(nn.Module):
 
         # 3. SSM transformation
         A = -torch.exp(self.A_log.float())                            # [num_heads]
+        # if "longmamba" in self.experiments:
+        #     # dt alignment
+        #     params_for_debug = {}
+        #     dt = nn.functional.softplus(dt + self.dt_bias)
+        #     if merge_config is not None and merge_config['model_arch'] == "ours" and int(self.seq_len/1e3) > 2:
+        #         channel_threshold = merge_config['c']
+        #         tA_prod_path = f"./artifacts/{merge_config['align_path']}/tA_prod/tA_prod_layer_{self.layer_idx}.pt"
+        #         alpha_path = f"./artifacts/{merge_config['align_path']}/alpha/alpha_layer_{self.layer_idx}.pt"
+        #         decay_path = f"./artifacts/{merge_config['align_path']}/decay/decay_layer_{self.layer_idx}.pt"
+        #         dt_thre_path = f"./artifacts/{merge_config['align_path']}/delta_t-thre/delta_t-thre_layer_{self.layer_idx}.pt"
+        #         tA_prod = torch.load(tA_prod_path, map_location=dt.device)
+        #         self.channel_mask = tA_prod > channel_threshold
+        #         whether_mask = self.channel_mask.sum() != 0
+        #         available_values = []
+        #         if merge_config['our_method'] in ["alpha", "offline"]:
+        #             alpha_all = torch.load(alpha_path, map_location=dt.device)
+        #             for k in alpha_all:
+        #                 available_values.append(int(k[:-1])*1e3)
+        #         elif merge_config['our_method'] in ["bound", "norm"]:  
+        #             decay = torch.load(decay_path, map_location=dt.device)
+        #         elif merge_config['our_method'] in ["dt_thre"]:
+        #             dt_thre_all = torch.load(dt_thre_path, map_location=dt.device)
+        #             for k in dt_thre_all:
+        #                 available_values.append(int(k[:-1])*1e3)
+                    
+        #         self.slow_factor = 0
+        #         self.topk = 2000
+        #         dt = rearrange(dt, "b l h -> b h l")
+        #         if merge_config['our_method'] == "channelwise_topk" and whether_mask:
+        #             topk_mask = get_topk_mask_channelwise(delta_t=dt[:, self.channel_mask], k=self.topk)
+        #             dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+        #         elif merge_config['our_method'] == "all_topk" and whether_mask:
+        #             topk_indice = get_top_k_token_indices(dt[:, self.channel_mask], k=self.topk)
+        #             topk_mask = torch.zeros_like(dt[:, self.channel_mask], dtype=torch.bool)
+        #             topk_mask[:,:,topk_indice] = True
+        #             dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+        #         elif whether_mask and merge_config['b'] != 0:
+        #             key_num = int(min(available_values, key=lambda x: abs(self.seqlen - x))/1e3) if available_values != [] else None
+        #             if "alpha" in merge_config['our_method']:
+        #                 channel_alpha = alpha_all[f"{key_num}k"].to(dt.device)
+        #                 topk_mask = get_channelwise_topAlpha(delta_t=dt[:, self.channel_mask], alpha=channel_alpha[self.channel_mask]*merge_config['b'])
+        #                 dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+        #             elif "offline" in merge_config['our_method']:
+        #                 key_num_offline = int(min(available_values, key=lambda x: abs(self.seqlen - x))/1e3)
+        #                 channel_alpha = alpha_all[f"{key_num_offline}k"].to(dt.device)
+        #                 topk_mask, _ = get_channelwise_offline(delta_t=dt[:, self.channel_mask], alpha=channel_alpha[self.channel_mask]*merge_config['b'])
+        #                 dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+        #             elif "bound" in merge_config['our_method']:
+        #                 topk_mask = get_channelwise_topBound(delta_t=dt[:, self.channel_mask], decay=decay[self.channel_mask]*merge_config['b'])
+        #                 dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+        #             elif "norm" in merge_config['our_method']:
+        #                 dt_norm = get_channelwise_normalize(delta_t=dt[:, self.channel_mask], decay=decay[self.channel_mask]*merge_config['b'])
+        #                 dt[:, self.channel_mask] = dt_norm
+        #             elif "dt_thre" in merge_config['our_method']:
+        #                 channel_dt_thre_all = dt_thre_all[f"{key_num}k"].to(dt.device)
+        #                 # self.dt_thre[f"layer_{self.layer_idx}"] = channel_dt_thre_all
+        #                 topk_mask = get_channelwise_dt_threshold(delta_t=dt[:, self.channel_mask], dt_thre=channel_dt_thre_all[self.channel_mask]*merge_config['b'])
+        #                 dt[:, self.channel_mask] = torch.where(topk_mask, dt[:, self.channel_mask], dt[:, self.channel_mask] * self.slow_factor)
+        #         else:
+        #             if whether_mask:
+        #                 print("Warning: no method is applied")
+        #             dt[:, self.channel_mask] = dt[:, self.channel_mask] * 0
+        #         dt = rearrange(dt, "b h l -> b l h")
+        #     if merge_config['save_para4debug']:
+        #         params_for_debug['A'] = A.clone().cpu()
+        #         params_for_debug['Sb_x'] = B.clone().cpu()  # B before discretization
+        #         params_for_debug['C'] = C.clone().cpu()
+        #         params_for_debug['delta_t'] = dt.clone().cpu()
+        #         print("Save parameters mamba2 debug")
+        #         params_for_debug['B_t'] = None
+            
+        #     dt_bias = None
+        #     dt_softplus = False
+        #     # Change params_for_debug from outputing to saving to log file
+        #     with open(self.experiments["longmamba"], 'a') as f:
+        #         f.write(json.dumps(params_for_debug) + '\n')
+
         if use_precomputed_states:
+            self.seq_len += 1
             # We need to guarantee that anything regarding the cache is on the same device
             cache_device = cache_params.ssm_states[self.layer_idx].device
 
@@ -660,7 +925,16 @@ class GraniteMoeHybridMambaLayer(nn.Module):
             # [num_heads] -> [num_heads, head_dim]
             dt_bias = self.dt_bias[..., None].expand(self.dt_bias.shape[0], self.head_dim)
 
-            dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
+            dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))   
+            # if "upi" in self.experiments:
+            #     if self.upi_dynamic:
+            #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+            #     else:
+            #         upi_mask = self.upi_mask
+            #     dt = dt / upi_mask[:, None]
+            
+            # if "proper_upi" in self.experiments:
+            #     A, X, dt_sp = scale_proper(scale, A, X, dt, dt_bias)
             dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
             A = A[..., None, None].expand(self.num_heads, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
             # [bsz, num_heads, head_dim, state_size]
@@ -707,8 +981,15 @@ class GraniteMoeHybridMambaLayer(nn.Module):
             # [bsz, num_heads, head_dim] -> [bsz, 1, intermediate_size]
             y = y.reshape(batch_size, -1)[:, None, ...]
         else:
+            self.seq_len = seq_len
             # begin ssd naive implementation without einsums
             dt = nn.functional.softplus(dt + self.dt_bias)
+            # if "upi" in self.experiments:
+            #     if self.upi_dynamic:
+            #         upi_mask = dynamic_scale_mask(self.upi_mask, self.seq_len, self.seq_len_scaled, self.seq_len_trained)
+            #     else:
+            #         upi_mask = self.upi_mask
+            #     dt = dt / upi_mask
             dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
             hidden_states = hidden_states.reshape(batch_size, seq_len, -1, self.head_dim).float()
             B = B.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
