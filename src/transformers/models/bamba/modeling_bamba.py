@@ -641,6 +641,8 @@ class BambaMixer(nn.Module):
         self.token_sig = self.experiments.get("token_sig", "softplus")
         self.scale_portion = self.experiments.get("scale_portion", 0.95)
 
+        self.distribution_reg = self.experiments.get("distribution_reg", False)
+
         if not is_fast_path_available:
             logger.warning_once(
                 "The fast path is not available because one of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
@@ -866,6 +868,21 @@ class BambaMixer(nn.Module):
                         self.logits_num += 1
                         if self.logits_num >= 5:
                             self.logits_reg = False
+
+                if self.distribution_reg:
+                    # (batch, seqlen, nheads)
+                    dtype = dt.dtype
+                    dt_sp = nn.functional.softplus((dt + self.dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
+                    forget = torch.exp(A * dt_sp)
+                    record = {
+                        "layer_idx": self.layer_idx,
+                        "dt": dt_sp.tolist(),
+                        "forget": forget.tolist()
+                        }
+                    filename = "/gpfs/hshen/mmd/bamba2.jsonl"
+                    os.makedirs(os.path.dirname(filename), exist_ok=True)
+                    with open(filename, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(record) + '\n')
 
                 hidden_states = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
                 dt_bias = self.dt_bias

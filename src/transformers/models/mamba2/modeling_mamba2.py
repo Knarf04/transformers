@@ -60,6 +60,11 @@ is_fast_path_available = all(
     )
 )
 
+from ...analysis.mmd import mmd_gqa_last, mmd_ssd_last, mmd_ssd_full_chunk
+
+_CHECKPOINT_FOR_DOC = "mistralai/mamba-codestral-7B-v0.1"
+_CONFIG_FOR_DOC = "Mamba2Config"
+
 
 # Helper methods for segment sum computation
 
@@ -305,7 +310,8 @@ class Mamba2Mixer(nn.Module):
         self.scale_portion = self.experiments.get("scale_portion", 0.95)
 
         self.mmd = self.experiments.get("mmd", False)
-        
+        self.distribution_reg = self.experiments.get("distribution_reg", False)
+
         if not is_fast_path_available:
             logger.warning_once(
                 "The fast path is not available because one of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
@@ -508,8 +514,25 @@ class Mamba2Mixer(nn.Module):
                         if self.logits_num >= 5:
                             self.logits_reg = False
 
+                if self.distribution_reg:
+                    # (batch, seqlen, nheads)
+                    dtype = dt.dtype
+                    dt_sp = nn.functional.softplus((dt + self.dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
+                    forget = torch.exp(A * dt_sp)
+                    record = {
+                        "layer_idx": self.layer_idx,
+                        "dt": dt_sp.tolist(),
+                        "forget": forget.tolist()
+                        }
+                    filename = "/gpfs/hshen/mmd/mamba2.jsonl"
+                    os.makedirs(os.path.dirname(filename), exist_ok=True)
+                    with open(filename, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(record) + '\n')
+                    
                 if self.mmd:
-                    mmd = mmd_ssd_last(dt, A, B, C, dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
+                    B_view = B.view(batch_size, seq_len, self.n_groups, -1)
+                    C_view = C.view(batch_size, seq_len, self.n_groups, -1)
+                    mmd = mmd_ssd_last(dt, A, B_view, C_view, dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
                     record = {
                         "layer_idx": self.layer_idx,
                         "seq_len": self.seq_len,
