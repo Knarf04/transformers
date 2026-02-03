@@ -1402,7 +1402,6 @@ class GraniteMoeHybridDecoderLayer(GradientCheckpointingLayer):
         self.self_attn = None
         self.input_layernorm = GraniteMoeHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GraniteMoeHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.block_sparse_moe = GraniteMoeHybridMoE(config)
         self.residual_multiplier = config.residual_multiplier  # Only diff with mixtral!
         self.shared_mlp = GraniteMoeHybridMLP(config)
         self.mamba = None
@@ -1415,6 +1414,7 @@ class GraniteMoeHybridDecoderLayer(GradientCheckpointingLayer):
 
         # Accept 0 experts: skip MoE if num_local_experts == 0
         self.has_experts = getattr(config, "num_local_experts", 0) > 0
+        self.block_sparse_moe = GraniteMoeHybridMoE(config) if self.has_experts else None
 
     @auto_docstring
     def forward(
