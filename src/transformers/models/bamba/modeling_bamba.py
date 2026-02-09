@@ -1420,9 +1420,9 @@ class BambaPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         super()._init_weights(module)
         if isinstance(module, BambaMixer):
-            module.dt_bias.data.fill_(1.0)
-            module.A_log.data = torch.log(torch.arange(1, module.num_heads + 1))
-            module.D.data.fill_(1.0)
+            module.dt_bias.fill_(1.0)
+            module.A_log.copy_(torch.log(torch.arange(1, module.num_heads + 1)))
+            module.D.fill_(1.0)
 
 
 @auto_docstring
