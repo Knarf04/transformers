@@ -178,6 +178,17 @@ class GraniteMoeHybridPreTrainedModel(GraniteMoeSharedPreTrainedModel):
 
     @torch.no_grad()
     def _init_weights(self, module):
+        # Handle nn.Embedding before delegating to super() to avoid the pad_token_id
+        # zeroing in PreTrainedModel._init_weights, which triggers a CUDA illegal memory
+        # access in distributed training setups (e.g. vocab-parallel embeddings). This
+        # matches the effective behavior of models like LLaMA that do not set pad_token_id
+        # and therefore never reach that code path. The padding row is already zeroed by
+        # nn.Embedding._fill_padding_idx_with_zero() during __init__.
+        if isinstance(module, nn.Embedding):
+            if getattr(module, "weight", None) is not None:
+                std = getattr(self.config, "initializer_range", 0.02) or 0.02
+                module.weight.normal_(mean=0.0, std=std)
+            return
         super()._init_weights(module)
         if isinstance(module, GraniteMoeHybridMambaLayer):
             module.dt_bias.fill_(1.0)

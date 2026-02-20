@@ -2290,17 +2290,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             if getattr(
                 self.config, "pad_token_id", None
             ) is not None and self.config.pad_token_id < module.weight.size(0):
-                # Skip for distributed/sharded embedding weights. Indexing into a sharded
-                # tensor with a global token id causes a CUDA illegal memory access because
-                # each rank only owns a slice of the vocabulary rows. We detect this via:
-                # 1. DTensor isinstance check (PyTorch >= 2.5 tensor-parallel)
-                # 2. device_mesh attribute presence (catches other DTensor-like types where
-                #    the isinstance check may fail due to import-path differences)
-                _is_sharded_weight = (_is_dtensor_available and isinstance(module.weight, DTensor)) or hasattr(
-                    module.weight, "device_mesh"
-                )
-                if not _is_sharded_weight:
-                    module.weight[self.config.pad_token_id].zero_()
+                module.weight[self.config.pad_token_id].zero_()
         elif isinstance(module, nn.MultiheadAttention):
             # This uses torch's original init
             module._reset_parameters()
