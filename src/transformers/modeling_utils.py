@@ -2290,7 +2290,11 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             if getattr(
                 self.config, "pad_token_id", None
             ) is not None and self.config.pad_token_id < module.weight.size(0):
-                module.weight[self.config.pad_token_id].zero_()
+                # Skip for DTensor weights (tensor-parallel sharded embeddings): indexing
+                # into a sharded tensor with a global token id causes a CUDA illegal memory
+                # access because each rank only owns a slice of the vocabulary rows.
+                if not (_is_dtensor_available and isinstance(module.weight, DTensor)):
+                    module.weight[self.config.pad_token_id].zero_()
         elif isinstance(module, nn.MultiheadAttention):
             # This uses torch's original init
             module._reset_parameters()
