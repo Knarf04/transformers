@@ -198,10 +198,14 @@ class BambaRotaryEmbedding(nn.Module):
         self.config = config
 
         self.rope_type = self.config.rope_parameters["rope_type"]
-        rope_init_fn: Callable = self.compute_default_rope_parameters
-        if self.rope_type != "default":
-            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+        if self.rope_type == "none":
+            self.attention_scaling = 1.0
+            inv_freq = torch.zeros(1, device=device)
+        else:
+            rope_init_fn: Callable = self.compute_default_rope_parameters
+            if self.rope_type != "default":
+                rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+            inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
@@ -239,6 +243,13 @@ class BambaRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
+        if self.rope_type == "none":
+            # Return identity embeddings: cos=1, sin=0 makes apply_rotary_pos_emb a no-op.
+            head_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
+            cos = torch.ones(position_ids.shape[0], position_ids.shape[-1], head_dim, device=x.device, dtype=x.dtype)
+            sin = torch.zeros(position_ids.shape[0], position_ids.shape[-1], head_dim, device=x.device, dtype=x.dtype)
+            return cos, sin
+
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
