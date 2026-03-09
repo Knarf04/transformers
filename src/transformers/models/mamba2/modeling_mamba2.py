@@ -35,6 +35,7 @@ from ...utils import (
 from ...utils.import_utils import is_causal_conv1d_available, is_mamba_2_ssm_available
 from .configuration_mamba2 import Mamba2Config
 from ...analysis.mmd import mmd_ssd_last, mmd_ssd_full_chunk
+from ...analysis.triton.mmd import mmd_ssd_last_triton
 
 logger = logging.get_logger(__name__)
 
@@ -522,7 +523,7 @@ class Mamba2Mixer(nn.Module):
                     forget = torch.exp(A * dt_sp)
                     B_reshaped = B.view(batch_size, seq_len, self.n_groups, -1)
                     C_reshaped = C.view(batch_size, seq_len, self.n_groups, -1)
-                    erf = mmd_ssd_last(dt, A, B_reshaped, C_reshaped, dt_bias=self.dt_bias)
+                    erf = mmd_ssd_last_triton(dt, A, B_reshaped, C_reshaped, dt_bias=self.dt_bias)
                     record = {
                         "layer_idx": self.layer_idx,
                         "dt": dt_sp.tolist(),
@@ -537,7 +538,7 @@ class Mamba2Mixer(nn.Module):
                 if self.mmd:
                     B_view = B.view(batch_size, seq_len, self.n_groups, -1)
                     C_view = C.view(batch_size, seq_len, self.n_groups, -1)
-                    mmd = mmd_ssd_last(dt, A, B_view, C_view, dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
+                    mmd = mmd_ssd_last_triton(dt, A, B_view, C_view, dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
                     record = {
                         "layer_idx": self.layer_idx,
                         "seq_len": self.seq_len,
