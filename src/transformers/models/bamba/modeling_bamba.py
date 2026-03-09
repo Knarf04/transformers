@@ -636,6 +636,7 @@ class BambaMixer(nn.Module):
         self.scale_portion = self.experiments.get("scale_portion", 0.95)
 
         self.distribution_reg = self.experiments.get("distribution_reg", False)
+        self.disp_name = self.experiments.get("disp_name", "bamba2")
 
         if not is_fast_path_available:
             logger.warning_once(
@@ -868,12 +869,16 @@ class BambaMixer(nn.Module):
                     dtype = dt.dtype
                     dt_sp = nn.functional.softplus((dt + self.dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
                     forget = torch.exp(A * dt_sp)
+                    B_reshaped = B.view(batch_size, seq_len, self.n_groups, -1)
+                    C_reshaped = C.view(batch_size, seq_len, self.n_groups, -1)
+                    erf = mmd_ssd_last(dt, A, B_reshaped, C_reshaped, dt_bias=self.dt_bias)
                     record = {
                         "layer_idx": self.layer_idx,
                         "dt": dt_sp.tolist(),
-                        "forget": forget.tolist()
+                        "forget": forget.tolist(),
+                        "erf": erf.tolist(),
                         }
-                    filename = "/gpfs/hshen/mmd/bamba2.jsonl"
+                    filename = f"/gpfs/hshen/mmd/{self.disp_name}.jsonl"
                     os.makedirs(os.path.dirname(filename), exist_ok=True)
                     with open(filename, "a", encoding="utf-8") as f:
                         f.write(json.dumps(record) + '\n')
