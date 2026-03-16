@@ -164,7 +164,118 @@ def mmd_ssd_last_triton(dt, A, B, C, dt_bias=None, dt_softplus=True, dt_limit=(0
         return out
 
 
-# ---- Reference PyTorch implementation ----
+# ---- State magnitude: chunkwise Triton version of state_mag_ssd_full_chunk ----
+#
+# Computes hidden state magnitude per token per head using the SSM recurrence:
+#   mag_t = exp(A_h * dt_t) * mag_{t-1} + dt_t * ||B_t|| * ||x_{t,h}||
+#
+# This is the recurrence form of state_mag_ssd_full_chunk (O(S) vs O(S^2)),
+# equivalent to summing L[t,s] * dt[s] * ||B[s]|| * ||x[s,h]|| over s <= t.
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_S": 64}, num_warps=4),
+        triton.Config({"BLOCK_S": 128}, num_warps=4),
+        triton.Config({"BLOCK_S": 256}, num_warps=4),
+    ],
+    key=["S"],
+)
+@triton.jit
+def _state_mag_kernel(
+    # All pointers are (BH, S) contiguous — flattened batch*heads rows
+    decay_ptr,  # exp(A[h] * dt[b,s,h])
+    inp_ptr,    # dt[b,s,h] * ||B[b,s]|| * ||x[b,s,h]||
+    out_ptr,    # output: hidden state magnitude per token
+    S,
+    BLOCK_S: tl.constexpr,
+):
+    pid = tl.program_id(0)  # indexes a (b, h) pair
+    base = pid * S
+
+    mag = 0.0
+    num_blocks = tl.cdiv(S, BLOCK_S)
+    for block_idx in range(num_blocks):
+        for i in tl.static_range(BLOCK_S):
+            s = block_idx * BLOCK_S + i
+            if s < S:
+                d = tl.load(decay_ptr + base + s)
+                inp_val = tl.load(inp_ptr + base + s)
+                mag = d * mag + inp_val
+                tl.store(out_ptr + base + s, mag)
+
+
+def state_mag_triton(dt, A, B, x, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
+    """Chunkwise Triton version of state_mag_ssd_full_chunk.
+
+    Computes hidden state magnitude per token per head via the SSM recurrence.
+
+    Args:
+        dt: (B, S, H)
+        A:  (H,)
+        B:  (B, S, G, N)
+        x:  (B, S, H, D)
+
+    Returns:
+        hidden_states: (B, nheads, S) — same layout as state_mag_ssd_full_chunk
+    """
+    with torch.no_grad():
+        if dt_bias is not None:
+            dt = dt + dt_bias
+        if dt_softplus:
+            dt = torch.nn.functional.softplus(dt.float())
+        if dt_limit is not None:
+            dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
+
+        batch, seqlen, nheads = dt.shape
+
+        decay = torch.exp((A * dt).float())  # (B, S, H)
+
+        x_norm = torch.linalg.vector_norm(x.float(), dim=-1)           # (B, S, H)
+        B_norm = torch.linalg.vector_norm(B.float(), dim=(-2, -1))     # (B, S)
+
+        inp = dt.float() * B_norm.unsqueeze(-1) * x_norm               # (B, S, H)
+
+        # Reshape to (BH, S) contiguous for kernel
+        decay_flat = decay.permute(0, 2, 1).contiguous().reshape(-1, seqlen)
+        inp_flat = inp.permute(0, 2, 1).contiguous().reshape(-1, seqlen)
+        out_flat = torch.empty_like(inp_flat)
+
+        BH = batch * nheads
+        _state_mag_kernel[(BH,)](decay_flat, inp_flat, out_flat, seqlen)
+
+        # Return (B, nheads, S) to match state_mag_ssd_full_chunk
+        return out_flat.reshape(batch, nheads, seqlen)
+
+
+# ---- Reference PyTorch implementations ----
+
+
+def state_mag_pytorch(dt, A, B, x, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
+    """PyTorch reference for state_mag_triton. Returns (B, nheads, S)."""
+    with torch.no_grad():
+        if dt_bias is not None:
+            dt = dt + dt_bias
+        if dt_softplus:
+            dt = torch.nn.functional.softplus(dt.float())
+        if dt_limit is not None:
+            dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
+
+        batch, seqlen, nheads = dt.shape
+
+        decay = torch.exp((A * dt).float())
+        x_norm = torch.linalg.vector_norm(x.float(), dim=-1)
+        B_norm = torch.linalg.vector_norm(B.float(), dim=(-2, -1))
+        inp = dt.float() * B_norm.unsqueeze(-1) * x_norm
+
+        mag = torch.zeros(batch, seqlen, nheads, device=dt.device, dtype=torch.float32)
+        running = torch.zeros(batch, nheads, device=dt.device, dtype=torch.float32)
+        for s in range(seqlen):
+            running = decay[:, s, :] * running + inp[:, s, :]
+            mag[:, s, :] = running
+
+        return mag.permute(0, 2, 1).contiguous()
+
 
 def mmd_ssd_last_pytorch(dt, A, B, C, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
     with torch.no_grad():
@@ -255,6 +366,43 @@ def test_parity_and_speed():
     print(f"[Speed] PyTorch: {pt_time:.3f} ms/iter")
     print(f"[Speed] Triton:  {tr_time:.3f} ms/iter")
     print(f"[Speed] Speedup: {pt_time / tr_time:.2f}x")
+
+    # ---- State magnitude parity check ----
+    print("\n---- State Magnitude ----")
+    head_dim = 64
+    x = torch.randn(batch, seqlen, nheads, head_dim, device=device, dtype=torch.float32) * 0.1
+
+    out_pt_mag = state_mag_pytorch(dt, A, B, x, dt_bias=dt_bias)
+    out_tr_mag = state_mag_triton(dt, A, B, x, dt_bias=dt_bias)
+
+    max_diff_mag = (out_pt_mag - out_tr_mag).abs().max().item()
+    mean_diff_mag = (out_pt_mag - out_tr_mag).abs().mean().item()
+    print(f"[Parity] max |diff| = {max_diff_mag:.6e}, mean |diff| = {mean_diff_mag:.6e}")
+    assert max_diff_mag < 1e-2, f"State mag parity check failed: max diff = {max_diff_mag}"
+    print("[Parity] PASSED")
+
+    # Speed
+    for _ in range(n_warmup):
+        _ = state_mag_pytorch(dt, A, B, x, dt_bias=dt_bias)
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(n_iters):
+        _ = state_mag_pytorch(dt, A, B, x, dt_bias=dt_bias)
+    torch.cuda.synchronize()
+    pt_mag_time = (time.perf_counter() - start) / n_iters * 1000
+
+    for _ in range(n_warmup):
+        _ = state_mag_triton(dt, A, B, x, dt_bias=dt_bias)
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(n_iters):
+        _ = state_mag_triton(dt, A, B, x, dt_bias=dt_bias)
+    torch.cuda.synchronize()
+    tr_mag_time = (time.perf_counter() - start) / n_iters * 1000
+
+    print(f"[Speed] PyTorch: {pt_mag_time:.3f} ms/iter")
+    print(f"[Speed] Triton:  {tr_mag_time:.3f} ms/iter")
+    print(f"[Speed] Speedup: {pt_mag_time / tr_mag_time:.2f}x")
 
 
 if __name__ == "__main__":
