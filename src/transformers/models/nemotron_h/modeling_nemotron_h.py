@@ -93,7 +93,7 @@ from einops import rearrange
 
 from ...analysis.LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
 from ...analysis.mmd import mmd_gqa_last, mmd_ssd_last, mmd_ssd_full_chunk
-from ...analysis.triton.mmd import mmd_ssd_last_triton
+from ...analysis.triton.mmd import mmd_ssd_last_triton, state_mag_triton
 
 # Helper methods for segment sum computation
 
@@ -581,11 +581,14 @@ class NemotronHMamba2Mixer(nn.Module):
                     B_reshaped = B.view(batch_size, seq_len, self.n_groups, -1)
                     C_reshaped = C.view(batch_size, seq_len, self.n_groups, -1)
                     erf = mmd_ssd_last_triton(dt, A, B_reshaped, C_reshaped, dt_bias=self.dt_bias)
+                    x_reshaped = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
+                    h_mag = state_mag_triton(dt, A, B_reshaped, x_reshaped, dt_bias=self.dt_bias)
                     record = {
                         "layer_idx": self.layer_idx,
                         "dt": dt_sp.tolist(),
                         "forget": forget.tolist(),
                         "erf": erf.tolist(),
+                        "h_mag": h_mag.tolist(),
                         }
                     filename = f"/gpfs/hshen/mmd/{self.disp_name}.jsonl"
                     os.makedirs(os.path.dirname(filename), exist_ok=True)

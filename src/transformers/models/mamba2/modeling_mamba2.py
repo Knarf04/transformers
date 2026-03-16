@@ -35,7 +35,7 @@ from ...utils import (
 from ...utils.import_utils import is_causal_conv1d_available, is_mamba_2_ssm_available
 from .configuration_mamba2 import Mamba2Config
 from ...analysis.mmd import mmd_ssd_last, mmd_ssd_full_chunk
-from ...analysis.triton.mmd import mmd_ssd_last_triton
+from ...analysis.triton.mmd import mmd_ssd_last_triton, state_mag_triton
 
 logger = logging.get_logger(__name__)
 
@@ -524,11 +524,14 @@ class Mamba2Mixer(nn.Module):
                     B_reshaped = B.view(batch_size, seq_len, self.n_groups, -1)
                     C_reshaped = C.view(batch_size, seq_len, self.n_groups, -1)
                     erf = mmd_ssd_last_triton(dt, A, B_reshaped, C_reshaped, dt_bias=self.dt_bias)
+                    x_reshaped = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
+                    h_mag = state_mag_triton(dt, A, B_reshaped, x_reshaped, dt_bias=self.dt_bias)
                     record = {
                         "layer_idx": self.layer_idx,
                         "dt": dt_sp.tolist(),
                         "forget": forget.tolist(),
                         "erf": erf.tolist(),
+                        "h_mag": h_mag.tolist(),
                         }
                     filename = f"/gpfs/hshen/mmd/{self.disp_name}.jsonl"
                     os.makedirs(os.path.dirname(filename), exist_ok=True)
