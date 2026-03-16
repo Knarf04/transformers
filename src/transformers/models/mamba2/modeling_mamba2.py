@@ -533,7 +533,7 @@ class Mamba2Mixer(nn.Module):
                         "erf": erf.tolist(),
                         "h_mag": h_mag.tolist(),
                         }
-                    filename = f"/gpfs/hshen/mmd/{self.disp_name}.jsonl"
+                    filename = f"/gpfs/hshen/mmd/{self.disp_name}_layer{self.layer_idx}.jsonl"
                     os.makedirs(os.path.dirname(filename), exist_ok=True)
                     with open(filename, "a", encoding="utf-8") as f:
                         f.write(json.dumps(record) + '\n')

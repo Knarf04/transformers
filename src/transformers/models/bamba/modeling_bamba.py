@@ -66,7 +66,6 @@ logger = logging.get_logger(__name__)
 import os
 
 from ...analysis.LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
-from ...analysis.mmd import mmd_gqa_last, mmd_ssd_last, mmd_ssd_full_chunk
 from ...analysis.triton.mmd import mmd_ssd_last_triton, state_mag_triton
 from ...analysis.upi import scale_dt, dynamic_scale_mask, scale_proper
 
@@ -882,7 +881,7 @@ class BambaMixer(nn.Module):
                         "erf": erf.tolist(),
                         "h_mag": h_mag.tolist(),
                         }
-                    filename = f"/gpfs/hshen/mmd/{self.disp_name}.jsonl"
+                    filename = f"/gpfs/hshen/mmd/{self.disp_name}_layer{self.layer_idx}.jsonl"
                     os.makedirs(os.path.dirname(filename), exist_ok=True)
                     with open(filename, "a", encoding="utf-8") as f:
                         f.write(json.dumps(record) + '\n')
