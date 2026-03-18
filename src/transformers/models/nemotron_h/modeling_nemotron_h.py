@@ -1440,6 +1440,8 @@ NEMOTRONH_INPUTS_DOCSTRING = r"""
 )
 class NemotronHModel(NemotronHPreTrainedModel):
     def __init__(self, config):
+        if getattr(config, "_attn_implementation_autoset", False):
+            config._attn_implementation = "flash_attention_2"
         super().__init__(config)
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
