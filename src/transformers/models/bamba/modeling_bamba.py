@@ -66,7 +66,7 @@ logger = logging.get_logger(__name__)
 import os
 
 from ...analysis.LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
-from ...analysis.triton.mmd import mmd_ssd_last_triton
+from ...analysis.triton.mmd import mmd_ssd_last_triton, state_cosine_sim_triton
 from ...analysis.upi import scale_dt, dynamic_scale_mask, scale_proper
 
 class BambaFlashAttentionKwargs(TypedDict, total=False):
@@ -638,6 +638,8 @@ class BambaMixer(nn.Module):
         self.distribution_reg = self.experiments.get("distribution_reg", False)
         self.disp_name = self.experiments.get("disp_name", "bamba2")
 
+        self.state_sample_interval = self.experiments.get("state_sample_interval", 2048)
+
         if not is_fast_path_available:
             logger.warning_once(
                 "The fast path is not available because one of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
@@ -876,6 +878,14 @@ class BambaMixer(nn.Module):
                     forget_mean_seq = forget.mean(dim=1)  # (batch, nheads)
                     # spectrum_std: std of per-head forget means over head dim
                     spectrum_std = forget_mean_seq.std(dim=-1)  # (batch,)
+
+                    seq_len_trunc = seq_len - seq_len % self.state_sample_interval
+                    state_cos_sim = state_cosine_sim_triton(
+                                        dt[:, :seq_len_trunc], A,
+                                        B_reshaped[:, :seq_len_trunc],
+                                        hidden_states[:, :seq_len_trunc].view(batch_size, seq_len_trunc, -1, self.head_dim),
+                                        interval=self.state_sample_interval, dt_bias=self.dt_bias,
+                                    )
                     record = {
                         "layer_idx": self.layer_idx,
                         "dt_mean": dt_sp.mean(dim=1).tolist(),
@@ -884,8 +894,9 @@ class BambaMixer(nn.Module):
                         "forget_var": forget.var(dim=1).tolist(),
                         "spectrum_std": spectrum_std.tolist(),
                         "erf": erf.tolist(),
+                        "state_cos_sim": state_cos_sim.tolist(),
                         }
-                    filename = f"/gpfs/hshen/mmd/{self.disp_name}_layer{self.layer_idx}.jsonl"
+                    filename = f"/gpfs/hshen/mmd/{self.disp_name}/layer{self.layer_idx}.jsonl"
                     os.makedirs(os.path.dirname(filename), exist_ok=True)
                     with open(filename, "a", encoding="utf-8") as f:
                         f.write(json.dumps(record) + '\n')

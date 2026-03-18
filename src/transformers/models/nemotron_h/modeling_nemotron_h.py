@@ -93,7 +93,7 @@ from einops import rearrange
 
 from ...analysis.LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
 from ...analysis.mmd import mmd_gqa_last, mmd_ssd_last, mmd_ssd_full_chunk
-from ...analysis.triton.mmd import mmd_ssd_last_triton, state_mag_triton
+from ...analysis.triton.mmd import mmd_ssd_last_triton, state_mag_triton, state_cosine_sim_triton
 
 # Helper methods for segment sum computation
 
@@ -369,6 +369,7 @@ class NemotronHMamba2Mixer(nn.Module):
 
         self.distribution_reg = self.experiments.get("distribution_reg", False)
         self.disp_name = self.experiments.get("disp_name", "nemotronh")
+        self.state_sample_interval = self.experiments.get("state_sample_interval", 2048)
 
         if not is_fast_path_available:
             logger.warning_once(
@@ -574,23 +575,33 @@ class NemotronHMamba2Mixer(nn.Module):
                             self.logits_reg = False
                 
                 if self.distribution_reg:
-                    # (batch, seqlen, nheads)
                     dtype = dt.dtype
                     dt_sp = nn.functional.softplus((dt + self.dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
                     forget = torch.exp(A * dt_sp)
                     B_reshaped = B.view(batch_size, seq_len, self.n_groups, -1)
                     C_reshaped = C.view(batch_size, seq_len, self.n_groups, -1)
                     erf = mmd_ssd_last_triton(dt, A, B_reshaped, C_reshaped, dt_bias=self.dt_bias)
-                    x_reshaped = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
-                    h_mag = state_mag_triton(dt, A, B_reshaped, x_reshaped, dt_bias=self.dt_bias)
+                    forget_mean_seq = forget.mean(dim=1)
+                    spectrum_std = forget_mean_seq.std(dim=-1)
+
+                    seq_len_trunc = seq_len - seq_len % self.state_sample_interval
+                    state_cos_sim = state_cosine_sim_triton(
+                        dt[:, :seq_len_trunc], A,
+                        B_reshaped[:, :seq_len_trunc],
+                        hidden_states[:, :seq_len_trunc].view(batch_size, seq_len_trunc, -1, self.head_dim),
+                        interval=self.state_sample_interval, dt_bias=self.dt_bias,
+                    )
                     record = {
                         "layer_idx": self.layer_idx,
-                        "dt": dt_sp.tolist(),
-                        "forget": forget.tolist(),
+                        "dt_mean": dt_sp.mean(dim=1).tolist(),
+                        "dt_var": dt_sp.var(dim=1).tolist(),
+                        "forget_mean": forget_mean_seq.tolist(),
+                        "forget_var": forget.var(dim=1).tolist(),
+                        "spectrum_std": spectrum_std.tolist(),
                         "erf": erf.tolist(),
-                        "h_mag": h_mag.tolist(),
-                        }
-                    filename = f"/gpfs/hshen/mmd/{self.disp_name}_layer{self.layer_idx}.jsonl"
+                        "state_cos_sim": state_cos_sim.tolist(),
+                    }
+                    filename = f"/gpfs/hshen/mmd/{self.disp_name}/layer{self.layer_idx}.jsonl"
                     os.makedirs(os.path.dirname(filename), exist_ok=True)
                     with open(filename, "a", encoding="utf-8") as f:
                         f.write(json.dumps(record) + '\n')
