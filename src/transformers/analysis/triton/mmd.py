@@ -405,5 +405,322 @@ def test_parity_and_speed():
     print(f"[Speed] Speedup: {pt_mag_time / tr_mag_time:.2f}x")
 
 
+# ---- State cosine similarity: Triton version of state_cosine_sim_full_chunk ----
+#
+# Uses the SSM recurrence h[t] = exp(A*dt[t]) * h[t-1] + dt[t] * (B[t] ⊗ x[t])
+# instead of the quadratic O(S²) chunked computation. This is O(S * N * D) per (b, h).
+#
+# Grid: one program per (b, h, n_tile, d_tile).
+# Each program maintains a (N_BLOCK, D_BLOCK) slice of the (N, D) state matrix in
+# registers, scans through the full sequence, and writes the state to HBM at each
+# sampled position p_i = (i+1)*interval - 1.
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"N_BLOCK": 16, "D_BLOCK": 16}, num_warps=4),
+        triton.Config({"N_BLOCK": 32, "D_BLOCK": 16}, num_warps=4),
+        triton.Config({"N_BLOCK": 16, "D_BLOCK": 32}, num_warps=4),
+        triton.Config({"N_BLOCK": 32, "D_BLOCK": 32}, num_warps=8),
+        triton.Config({"N_BLOCK": 64, "D_BLOCK": 16}, num_warps=8),
+        triton.Config({"N_BLOCK": 16, "D_BLOCK": 64}, num_warps=8),
+    ],
+    key=["S", "N", "D"],
+)
+@triton.jit
+def _state_sample_kernel(
+    dt_ptr,    # (B, S, H) — preprocessed (softplus + clamp applied)
+    A_ptr,     # (H,)
+    B_ptr,     # (B, S, G, N)
+    x_ptr,     # (B, S, H, D)
+    out_ptr,   # (B, H, npos, N, D) — output sampled states
+    S, H, N, D,
+    interval, npos, group_size,
+    stride_dt_b, stride_dt_s, stride_dt_h,
+    stride_A,
+    stride_B_b, stride_B_s, stride_B_g, stride_B_n,
+    stride_x_b, stride_x_s, stride_x_h, stride_x_d,
+    stride_out_b, stride_out_h, stride_out_pos, stride_out_n, stride_out_d,
+    N_BLOCK: tl.constexpr,
+    D_BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    n_tiles = tl.cdiv(N, N_BLOCK)
+    d_tiles = tl.cdiv(D, D_BLOCK)
+    nd_tiles = n_tiles * d_tiles
+
+    bh_id     = pid // nd_tiles
+    nd_id     = pid % nd_tiles
+    n_tile_id = nd_id // d_tiles
+    d_tile_id = nd_id % d_tiles
+
+    b = bh_id // H
+    h = bh_id % H
+    g = h // group_size
+
+    n_offs = n_tile_id * N_BLOCK + tl.arange(0, N_BLOCK)  # (N_BLOCK,)
+    d_offs = d_tile_id * D_BLOCK + tl.arange(0, D_BLOCK)  # (D_BLOCK,)
+    n_mask = n_offs < N
+    d_mask = d_offs < D
+
+    # Load A[h] once — scalar decay parameter for this head
+    A_val = tl.load(A_ptr + h * stride_A)
+
+    # Base pointers: incorporate all fixed indices so the s-loop only adds stride_*_s
+    dt_base = dt_ptr + b * stride_dt_b + h * stride_dt_h                          # scalar
+    B_base  = B_ptr  + b * stride_B_b  + g * stride_B_g  + n_offs * stride_B_n   # (N_BLOCK,)
+    x_base  = x_ptr  + b * stride_x_b  + h * stride_x_h  + d_offs * stride_x_d  # (D_BLOCK,)
+
+    # SSM state for this (b, h, n_tile, d_tile) block — lives in registers
+    state = tl.zeros((N_BLOCK, D_BLOCK), dtype=tl.float32)
+
+    for s in range(S):
+        dt_val = tl.load(dt_base + s * stride_dt_s)
+        decay  = tl.exp(A_val * dt_val)
+
+        B_vals = tl.load(B_base + s * stride_B_s, mask=n_mask, other=0.0)  # (N_BLOCK,)
+        x_vals = tl.load(x_base + s * stride_x_s, mask=d_mask, other=0.0)  # (D_BLOCK,)
+
+        # h[s] = decay * h[s-1] + dt[s] * (B[s] ⊗ x[s])
+        state = decay * state + dt_val * (B_vals[:, None] * x_vals[None, :])
+
+        # Store at sampled position p_i = (i+1)*interval - 1, i.e. when (s+1) % interval == 0
+        if (s + 1) % interval == 0:
+            pos = s // interval
+            out_ptrs = (out_ptr
+                        + b * stride_out_b
+                        + h * stride_out_h
+                        + pos * stride_out_pos
+                        + n_offs[:, None] * stride_out_n
+                        + d_offs[None, :] * stride_out_d)
+            tl.store(out_ptrs, state, mask=n_mask[:, None] & d_mask[None, :])
+
+
+def state_cosine_sim_triton(dt, A, B, x, interval, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
+    """Triton implementation of state_cosine_sim_full_chunk.
+
+    Computes pairwise cosine similarity between SSM hidden states at positions
+    interval-1, 2*interval-1, ..., seqlen-1 via the SSM recurrence.
+    This is O(S*N*D) per (b,h) vs O(S²) for the chunked PyTorch version.
+
+    Args:
+        dt:       (B, S, H)
+        A:        (H,)
+        B:        (B, S, G, N)
+        x:        (B, S, H, D)
+        interval: int — spacing between sampled positions; seqlen % interval == 0
+
+    Returns:
+        cosine_sim: (B, H, npos, npos) — strictly lower-triangular cosine similarity
+    """
+    with torch.no_grad():
+        if dt_bias is not None:
+            dt = dt + dt_bias
+        if dt_softplus:
+            dt = torch.nn.functional.softplus(dt.float())
+        if dt_limit is not None:
+            dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
+
+        batch, seqlen, nheads = dt.shape
+        ngroups    = B.shape[2]
+        state_dim  = B.shape[3]  # N
+        head_dim   = x.shape[3]  # D
+        group_size = nheads // ngroups
+
+        assert seqlen % interval == 0, f"seqlen ({seqlen}) must be divisible by interval ({interval})"
+        npos = seqlen // interval
+
+        dt = dt.contiguous().float()
+        A  = A.contiguous().float()
+        B  = B.contiguous().float()
+        x  = x.contiguous().float()
+
+        # Output: sampled states (B, H, npos, N, D)
+        out = torch.zeros(batch, nheads, npos, state_dim, head_dim,
+                          device=dt.device, dtype=torch.float32)
+
+        grid = lambda meta: (
+            batch * nheads
+            * triton.cdiv(state_dim, meta["N_BLOCK"])
+            * triton.cdiv(head_dim,  meta["D_BLOCK"]),
+        )
+
+        _state_sample_kernel[grid](
+            dt, A, B, x, out,
+            seqlen, nheads, state_dim, head_dim,
+            interval, npos, group_size,
+            dt.stride(0), dt.stride(1), dt.stride(2),
+            A.stride(0),
+            B.stride(0), B.stride(1), B.stride(2), B.stride(3),
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        )
+
+        # Flatten state dim and compute pairwise cosine similarity
+        states_flat = out.reshape(batch, nheads, npos, state_dim * head_dim)
+        norms       = torch.linalg.vector_norm(states_flat, dim=-1, keepdim=True)
+        states_norm = states_flat / (norms + 1e-8)
+        cosine_sim  = torch.matmul(states_norm, states_norm.transpose(-2, -1))
+
+        # Retain only strictly lower triangle (j < i)
+        mask = torch.tril(torch.ones(npos, npos, dtype=torch.bool, device=cosine_sim.device), diagonal=-1)
+        cosine_sim = cosine_sim * mask
+
+    return cosine_sim
+
+
+# ---- Reference PyTorch implementation (recurrence-based) ----
+
+
+def state_cosine_sim_pytorch(dt, A, B, x, interval, dt_bias=None, dt_softplus=True, dt_limit=(0.0, float("inf"))):
+    """Recurrence-based PyTorch reference for state_cosine_sim_triton.
+
+    Mathematically equivalent to state_cosine_sim_full_chunk but uses the O(S*N*D)
+    SSM recurrence rather than the quadratic chunked formulation.
+
+    Args / Returns: same as state_cosine_sim_triton.
+    """
+    with torch.no_grad():
+        if dt_bias is not None:
+            dt = dt + dt_bias
+        if dt_softplus:
+            dt = torch.nn.functional.softplus(dt.float())
+        if dt_limit is not None:
+            dt = torch.clamp(dt, dt_limit[0], dt_limit[1])
+
+        batch, seqlen, nheads = dt.shape
+        ngroups    = B.shape[2]
+        state_dim  = B.shape[3]
+        head_dim   = x.shape[3]
+        group_size = nheads // ngroups
+        npos       = seqlen // interval
+
+        # Expand B from G groups to H heads: (B, S, H, N)
+        B_exp = B.float().repeat_interleave(group_size, dim=2)
+
+        state = torch.zeros(batch, nheads, state_dim, head_dim,
+                            device=dt.device, dtype=torch.float32)
+        sampled = []
+
+        for s in range(seqlen):
+            d    = torch.exp(A * dt[:, s, :])          # (B, H)
+            dt_s = dt[:, s, :]                          # (B, H)
+            B_s  = B_exp[:, s, :, :]                   # (B, H, N)
+            x_s  = x[:, s, :, :].float()               # (B, H, D)
+
+            outer = B_s[:, :, :, None] * x_s[:, :, None, :]              # (B, H, N, D)
+            state = d[:, :, None, None] * state + dt_s[:, :, None, None] * outer
+
+            if (s + 1) % interval == 0:
+                sampled.append(state.cpu().clone())
+
+        # (npos, B, H, N, D) -> (B, H, npos, N, D)
+        states      = torch.stack(sampled, dim=0).permute(1, 2, 0, 3, 4)
+        states_flat = states.reshape(batch, nheads, npos, state_dim * head_dim)
+
+        norms       = torch.linalg.vector_norm(states_flat, dim=-1, keepdim=True)
+        states_norm = states_flat / (norms + 1e-8)
+        cosine_sim  = torch.matmul(states_norm, states_norm.transpose(-2, -1))
+
+        mask = torch.tril(torch.ones(npos, npos, dtype=torch.bool), diagonal=-1)
+        cosine_sim = cosine_sim * mask.to(cosine_sim.device)
+
+    return cosine_sim
+
+
+# ---- Parity and speed test for state cosine similarity ----
+
+
+def test_state_cosine_sim_parity():
+    import time
+    import sys
+    import os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from mmd import state_cosine_sim_full_chunk
+
+    torch.manual_seed(0)
+    device = "cuda"
+
+    # Small shapes for parity (the quadratic reference is expensive at large S)
+    batch, seqlen, nheads, ngroups, state_dim, head_dim = 2, 512, 8, 2, 32, 32
+    interval   = 64   # npos = 8
+    chunk_size = 64   # for the quadratic reference
+
+    dt     = torch.randn(batch, seqlen, nheads, device=device, dtype=torch.float32).abs() * 0.1
+    A      = -torch.rand(nheads, device=device, dtype=torch.float32) * 0.5
+    B      = torch.randn(batch, seqlen, ngroups, state_dim, device=device, dtype=torch.float32) * 0.01
+    x      = torch.randn(batch, seqlen, nheads, head_dim, device=device, dtype=torch.float32) * 0.1
+    dt_bias = torch.randn(nheads, device=device, dtype=torch.float32) * 0.1
+
+    print("---- State Cosine Similarity ----")
+
+    # Triton vs. recurrence PyTorch reference (both O(S*N*D))
+    out_tr = state_cosine_sim_triton(dt, A, B, x, interval, dt_bias=dt_bias)
+    out_pt = state_cosine_sim_pytorch(dt, A, B, x, interval, dt_bias=dt_bias)
+
+    # Compare only the lower-triangle entries (upper is zero by construction)
+    npos = seqlen // interval
+    lt_mask = torch.tril(torch.ones(npos, npos, dtype=torch.bool), diagonal=-1)
+    out_tr_lt = out_tr[:, :, lt_mask]
+    out_pt_lt = out_pt[:, :, lt_mask].to(device)
+
+    max_diff  = (out_tr_lt - out_pt_lt).abs().max().item()
+    mean_diff = (out_tr_lt - out_pt_lt).abs().mean().item()
+    print(f"[Parity vs recurrence ref] max |diff| = {max_diff:.6e}, mean |diff| = {mean_diff:.6e}")
+    assert max_diff < 1e-3, f"Parity check failed (Triton vs recurrence ref): max diff = {max_diff}"
+    print("[Parity vs recurrence ref] PASSED")
+
+    # Triton vs. quadratic chunked reference (state_cosine_sim_full_chunk)
+    out_quad = state_cosine_sim_full_chunk(
+        dt, A, B, x, interval=interval, chunk_size=chunk_size,
+        dt_bias=dt_bias, device=device,
+    )
+    out_tr_cpu  = out_tr.cpu()
+    out_tr_lt2  = out_tr_cpu[:, :, lt_mask]
+    out_quad_lt = out_quad[:, :, lt_mask]
+
+    max_diff2  = (out_tr_lt2 - out_quad_lt).abs().max().item()
+    mean_diff2 = (out_tr_lt2 - out_quad_lt).abs().mean().item()
+    print(f"[Parity vs quadratic ref]  max |diff| = {max_diff2:.6e}, mean |diff| = {mean_diff2:.6e}")
+    assert max_diff2 < 1e-3, f"Parity check failed (Triton vs quadratic ref): max diff = {max_diff2}"
+    print("[Parity vs quadratic ref]  PASSED")
+
+    # Speed comparison (larger shapes, no quadratic reference)
+    batch2, seqlen2, nheads2, ngroups2, state_dim2, head_dim2 = 2, 4096, 32, 4, 64, 64
+    interval2 = 128  # npos = 32
+    dt2    = torch.randn(batch2, seqlen2, nheads2, device=device, dtype=torch.float32).abs() * 0.1
+    A2     = -torch.rand(nheads2, device=device, dtype=torch.float32) * 0.5
+    B2     = torch.randn(batch2, seqlen2, ngroups2, state_dim2, device=device, dtype=torch.float32) * 0.01
+    x2     = torch.randn(batch2, seqlen2, nheads2, head_dim2, device=device, dtype=torch.float32) * 0.1
+    dt_bias2 = torch.randn(nheads2, device=device, dtype=torch.float32) * 0.1
+
+    n_warmup, n_iters = 5, 20
+
+    for _ in range(n_warmup):
+        _ = state_cosine_sim_pytorch(dt2, A2, B2, x2, interval2, dt_bias=dt_bias2)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n_iters):
+        _ = state_cosine_sim_pytorch(dt2, A2, B2, x2, interval2, dt_bias=dt_bias2)
+    torch.cuda.synchronize()
+    pt_time = (time.perf_counter() - t0) / n_iters * 1000
+
+    for _ in range(n_warmup):
+        _ = state_cosine_sim_triton(dt2, A2, B2, x2, interval2, dt_bias=dt_bias2)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n_iters):
+        _ = state_cosine_sim_triton(dt2, A2, B2, x2, interval2, dt_bias=dt_bias2)
+    torch.cuda.synchronize()
+    tr_time = (time.perf_counter() - t0) / n_iters * 1000
+
+    print(f"\n[Speed] B={batch2} S={seqlen2} H={nheads2} N={state_dim2} D={head_dim2} interval={interval2}")
+    print(f"[Speed] PyTorch (recurrence): {pt_time:.3f} ms/iter")
+    print(f"[Speed] Triton:               {tr_time:.3f} ms/iter")
+    print(f"[Speed] Speedup:              {pt_time / tr_time:.2f}x")
+
+
 if __name__ == "__main__":
     test_parity_and_speed()
+    print()
+    test_state_cosine_sim_parity()
