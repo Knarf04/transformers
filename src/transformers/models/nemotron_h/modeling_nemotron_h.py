@@ -17,33 +17,24 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import CrossEntropyLoss
-
 from ...activations import ACT2FN
-from ...cache_utils import DynamicCache  # we need __iter__ and __len__ of pkv
 from ...generation import GenerationMixin
 from ...modeling_attn_mask_utils import (
     AttentionMaskConverter,
 )
+from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_utils import PreTrainedModel, ALL_ATTENTION_FUNCTIONS
+from ...processing_utils import Unpack
+from ...utils import ModelOutput, TransformersKwargs, auto_docstring, can_return_tuple, logging
 from ...utils.deprecation import deprecate_kwarg
-from ...utils import (
-    ModelOutput,
-    add_code_sample_docstrings,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    logging,
-)
 from ...utils.import_utils import (
     is_causal_conv1d_available,
-    is_flash_attn_2_available,
-    is_flash_attn_greater_or_equal_2_10,
-    is_mamba_2_ssm_available,    
+    is_mamba_2_ssm_available,
 )
 from .configuration_nemotron_h import NemotronHConfig
 
@@ -70,9 +61,6 @@ if is_causal_conv1d_available():
 else:
     causal_conv1d_update, causal_conv1d_fn = None, None
 
-if is_flash_attn_2_available():
-    from ...modeling_flash_attention_utils import _flash_attention_forward
-
 is_fast_path_available = all(
     (
         selective_state_update,
@@ -84,15 +72,11 @@ is_fast_path_available = all(
 )
 
 
-_CHECKPOINT_FOR_DOC = "nvidia/Nemotron-H-56B-Base-8K"
-_CONFIG_FOR_DOC = "NemotronHConfig"
-
 import json
 import os
 from einops import rearrange
 
 from ...analysis.LongMamba import get_top_k_token_indices, get_topk_mask_channelwise, get_channelwise_topAlpha, get_channelwise_topBound, get_channelwise_offline, get_channelwise_normalize, get_channelwise_dt_threshold, merge_config
-from ...analysis.mmd import mmd_gqa_last, mmd_ssd_last, mmd_ssd_full_chunk
 from ...analysis.triton.mmd import mmd_ssd_last_triton, state_mag_triton, state_cosine_sim_triton
 
 # Helper methods for segment sum computation
@@ -159,8 +143,8 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
 
     return hidden_states
 
-# Copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/jamba/modeling_jamba.py
-class HybridMambaAttentionDynamicCache(DynamicCache):
+# Adapted from transformers.models.jamba.modeling_jamba.JambaHybridDynamicCache
+class HybridMambaAttentionDynamicCache:
     """
     A dynamic cache that can handle both the attention cache (which has a seq_len dimension) and the mamba cache
     (which has a constant shape regardless of seq_len).
@@ -174,14 +158,16 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
     and `ssm_states` represents the ssm state and has a shape of `(batch_size, d_inner, d_state)`.
     """
 
+    is_compileable = False
+
     def __init__(self, config, batch_size, dtype=torch.float16, device=None):
-        super().__init__()
         self.dtype = dtype
         self.hybrid_override_pattern = config.hybrid_override_pattern
         self.has_previous_state = False  # only used by mamba
         intermediate_size = config.expand * config.hidden_size
         ssm_state_size = config.ssm_state_size
         conv_kernel_size = config.conv_kernel
+        self.conv_kernel_size = conv_kernel_size  # stored so NemotronHMamba2Mixer can access it
         self.conv_states = []
         self.ssm_states = []
         self.transformer_layers = []
@@ -208,8 +194,8 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         layer_idx: int,
-        cache_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cache_kwargs: Optional[dict[str, Any]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Update the cache
         if self.key_cache[layer_idx].shape[-1] == 0:
             self.key_cache[layer_idx] = key_states
@@ -241,31 +227,41 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
             return 0
         return self.key_cache[layer_idx].shape[-2]
 
-    def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor]]:
-        raise NotImplementedError("HybridMambaAttentionDynamicCache does not have a legacy cache equivalent.")
+    def __len__(self) -> int:
+        return len(self.key_cache)
 
-    @classmethod
-    def from_legacy_cache(cls, past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None) -> "DynamicCache":
-        raise NotImplementedError("HybridMambaAttentionDynamicCache does not have a legacy cache equivalent.")
+    def __iter__(self):
+        for k, v in zip(self.key_cache, self.value_cache):
+            yield k, v
 
-    # Copied from modeling_mamba2.py
+    def __getitem__(self, layer_idx: int):
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+        """Return the length and offset of the cache, used to generate the mask"""
+        kv_offset = 0
+        query_length = cache_position.shape[0]
+        kv_length = self.get_seq_length(layer_idx) + query_length
+        return kv_length, kv_offset
+
     def update_conv_state(
         self, layer_idx: int, new_conv_state: torch.Tensor, cache_init: bool = False
     ) -> torch.Tensor:
         if cache_init:
-            self.conv_states[layer_idx] = new_conv_state.to(self.conv_states.device)
+            self.conv_states[layer_idx] = new_conv_state.to(self.conv_states[layer_idx].device)
         else:
             self.conv_states[layer_idx] = self.conv_states[layer_idx].roll(shifts=-1, dims=-1)
-            self.conv_states[layer_idx][:, :, -1] = new_conv_state[:, 0, :].to(self.conv_states.device)
+            self.conv_states[layer_idx][:, :, -1] = new_conv_state[:, 0, :].to(self.conv_states[layer_idx].device)
         return self.conv_states[layer_idx]
 
     def update_ssm_state(self, layer_idx: int, new_ssm_state: torch.Tensor):
-        self.ssm_states[layer_idx] = new_ssm_state.to(self.ssm_states.device)
+        self.ssm_states[layer_idx] = new_ssm_state.to(self.ssm_states[layer_idx].device)
         return self.ssm_states[layer_idx]
 
     def reset(self):
-        self.conv_states.zero_()
-        self.ssm_states.zero_()
+        for i in range(len(self.conv_states)):
+            self.conv_states[i].zero_()
+            self.ssm_states[i].zero_()
 
 class MambaRMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, group_size, eps=1e-5):
@@ -859,7 +855,7 @@ class NemotronHMamba2Mixer(nn.Module):
 
         if cache_params is not None and cache_position is not None and cache_position[0] > 0:
             # We need to guarantee that anything regarding the cache is on the same device
-            cache_device = cache_params.ssm_states.device
+            cache_device = cache_params.ssm_states[self.layer_idx].device
 
             # Note: there is no need to pad parameter matrices here, as there is just one new token
             # for batched generation
@@ -867,7 +863,7 @@ class NemotronHMamba2Mixer(nn.Module):
             dt = dt.transpose(1, 2).expand(batch_size, dt.shape[-1], self.head_dim)
             # [num_heads] -> [num_heads, head_dim]
 
-            if dt_bias:
+            if dt_bias is not None:
                 dt_bias = self.dt_bias[..., None].expand(self.dt_bias.shape[0], self.head_dim)
                 dt += dt_bias.to(dt.dtype)
 
@@ -922,7 +918,7 @@ class NemotronHMamba2Mixer(nn.Module):
             y = y.reshape(batch_size, -1)[:, None, ...]
         else:
             # begin ssd naive implementation without einsums
-            if dt_bias:
+            if dt_bias is not None:
                 dt += dt_bias
 
             if dt_softplus:
@@ -932,8 +928,8 @@ class NemotronHMamba2Mixer(nn.Module):
             hidden_states = hidden_states.reshape(batch_size, seq_len, -1, self.head_dim).float()
             B = B.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
             C = C.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
-            B = B.repeat(1, 1, self.num_heads // self.n_groups, 1)
-            C = C.repeat(1, 1, self.num_heads // self.n_groups, 1)
+            B = B.repeat_interleave(self.num_heads // self.n_groups, dim=2, output_size=self.num_heads)
+            C = C.repeat_interleave(self.num_heads // self.n_groups, dim=2, output_size=self.num_heads)
             pad_size = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
 
             D_residual = self.D[..., None] * pad_tensor_by_size(hidden_states, pad_size)
@@ -1047,7 +1043,7 @@ class NemotronHRMSNorm(nn.Module):
         # Weights are in float32
         return (self.weight.to(torch.float32) * hidden_states).to(input_dtype)
 
-class NemotronHBlock(nn.Module):
+class NemotronHBlock(GradientCheckpointingLayer):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
@@ -1083,11 +1079,15 @@ class NemotronHBlock(nn.Module):
 
             if self.block_type == "mamba":
                 hidden_states = self.mixer(
-                    hidden_states, cache_params=cache_params, cache_position=cache_position
+                    hidden_states, cache_params=cache_params, cache_position=cache_position,
+                    attention_mask=attention_mask,
                 )
             elif self.block_type == "attention":
                 hidden_states = self.mixer(
-                    hidden_states, cache_position=cache_position
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    past_key_values=cache_params,
+                    cache_position=cache_position,
                 )
                 hidden_states = hidden_states[0]
             elif self.block_type == "mlp":
@@ -1148,35 +1148,15 @@ def eager_attention_forward(
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
-    
-    if query.dtype == torch.float32:
-        if torch.is_autocast_enabled():
-            target_dtype = torch.get_autocast_gpu_dtype()
-        elif hasattr(module.config, "_pre_quantization_dtype"):
-            target_dtype = module.config._pre_quantization_dtype
-        else:
-            target_dtype = module.o_proj.weight.dtype
-    else:
-        target_dtype = query.dtype
-
-    query = query.to(torch.float32)
-    key_states = key_states.to(torch.float32)
-    value_states = value_states.to(torch.float32)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    if module.is_causal:
-        L = attn_weights.size(-1)
-        causal = torch.tril(torch.ones(L, L, device=attn_weights.device, dtype=torch.bool)).view(1, 1, L, L)
-        attn_weights = attn_weights.masked_fill(~causal, float("-inf"))
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states).to(target_dtype)
+    attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
@@ -1225,15 +1205,14 @@ class NemotronHAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        # position_embeddings: Tuple[torch.Tensor, torch.Tensor], #TODO
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[HybridMambaAttentionDynamicCache] = None,
+        past_key_values: Optional[HybridMambaAttentionDynamicCache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         bsz, q_len, _ = hidden_states.size()
 
@@ -1241,21 +1220,15 @@ class NemotronHAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        if past_key_value is not None:
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         self.is_causal = (attention_mask is None and q_len > 1)
 
         attention_interface = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, but specifying the manual "
-                    "implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation='eager'` when loading the model."
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
         if self.logits_reg:
             valid_mask = self.experiments.get("valid_mask", None)  # list[bool] or None
             with torch.no_grad():
@@ -1295,7 +1268,7 @@ class NemotronHAttention(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
 
 # Copied from transformers.models.mamba.modeling_mamba2.Mamba2PreTrainedModel
@@ -1310,8 +1283,14 @@ class NemotronHPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["NemotronHBlock"]
     supports_gradient_checkpointing = True
     _is_stateful = True
-    _supports_flash_attn_2 = True           # Flag for flash attention 2
-    _supports_attention_backend = True      # Flag for vllm paged-attention backend
+    _supports_flash_attn_2 = True           # keep for backward compatibility
+    _supports_flash_attn = True             # new canonical name
+    _supports_sdpa = True
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": NemotronHBlock,
+        "attentions": NemotronHAttention,
+    }
 
     def _init_weights(self, module):
         """Initialize the weights."""
@@ -1338,23 +1317,17 @@ class NemotronHPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=self.config.initializer_range)
 
-        # TODO: Check
         if self.config.rescale_prenorm_residual:
-            # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
-            #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
-            #   > the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual layers.
-            #   >   -- GPT-2 :: https://openai.com/blog/better-language-models/
-            #
-            # Reference (Megatron-LM): https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/gpt_model.py
+            # GPT-2 style 1/√N scaling for residual path (Megatron-LM).
+            # guard_nn_init_functions only protects nn.init.* calls; the manual
+            # p /= sqrt(N) must check _is_hf_initialized on the TENSOR to avoid
+            # destroying pretrained weights during v4.57.0 post-load reinitialization.
             for name, p in module.named_parameters():
                 if name in ["out_proj.weight"]:
-                    # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
-                    # Following Pytorch init, except scale by 1/sqrt(2 * n_layer)
-                    # We need to reinit p since this code could be called multiple times
-                    # Having just p *= scale would repeatedly scale it down
-                    nn.init.kaiming_uniform_(p, a=math.sqrt(5))
-                    with torch.no_grad():
-                        p /= math.sqrt(self.config.num_hidden_layers)
+                    if not getattr(p, "_is_hf_initialized", False):
+                        nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+                        with torch.no_grad():
+                            p /= math.sqrt(self.config.num_hidden_layers)
 
 
 @dataclass
@@ -1380,8 +1353,8 @@ class NemotronHOutput(ModelOutput):
 
     last_hidden_state: Optional[torch.FloatTensor] = None
     cache_params: Optional[HybridMambaAttentionDynamicCache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    hidden_states: Optional[tuple[torch.FloatTensor]] = None
+    attentions: Optional[tuple[torch.FloatTensor]] = None
 
 
 @dataclass
@@ -1410,77 +1383,13 @@ class NemotronHCausalLMOutput(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
     cache_params: Optional[HybridMambaAttentionDynamicCache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    hidden_states: Optional[tuple[torch.FloatTensor]] = None
+    attentions: Optional[tuple[torch.FloatTensor]] = None
 
 
-NEMOTRONH_START_DOCSTRING = r"""
-
-    This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
-    library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
-    etc.)
-
-    This model is also a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass.
-    Use it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage
-    and behavior.
-
-    Parameters:
-        config ([`NemotronHConfig`]): Model configuration class with all the parameters of the model.
-            Initializing with a config file does not load the weights associated with the model, only the
-            configuration. Check out the [`~PreTrainedModel.from_pretrained`] method to load the model weights.
-"""
-
-NEMOTRONH_INPUTS_DOCSTRING = r"""
-    Args:
-        input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`, *optional*):
-            Indices of input sequence tokens in the vocabulary.
-
-            If `cache_params.seqlen_offset>0`, only `input_ids` that do not have their past calculated should be passed as
-            `input_ids`.
-
-            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for details.
-
-            [What are input IDs?](../glossary#input-ids)
-        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-            Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
-            is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
-            model's internal embedding lookup matrix.
-        position_ids (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Indices of positions of each input sequence tokens in the position embeddings.
-        cache_params (`HybridMambaAttentionDynamicCache`, *optional*):
-            If passed along, the model uses the previous state in all the blocks (which will give the output for the
-            `input_ids` provided as if the model add `state_input_ids + input_ids` as context).
-        use_cache (`bool`, *optional*):
-            If set to `True`, the `cache_params` is returned and can be used to quickly generate the next logits.
-        output_attentions (`bool`, *optional*):
-            Whether or not to return the attentions tensors of all attention layers.
-        output_hidden_states (`bool`, *optional*):
-            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
-            more detail.
-        return_dict (`bool`, *optional*):
-            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
-        cache_position (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            The position of the current input in the cache. This is used to ensure that the cache is correctly updated.
-            If `cache_params` is passed, `cache_position` should also be passed.
-        attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-
-            [What are attention masks?](../glossary#attention-mask)
-"""
-
-
-@add_start_docstrings(
-    "The bare NemotronH Model transformer outputting raw hidden-states without any specific head on top.",
-    NEMOTRONH_START_DOCSTRING,
-)
+@auto_docstring
 class NemotronHModel(NemotronHPreTrainedModel):
     def __init__(self, config):
-        if config._attn_implementation is None:
-            config._attn_implementation = "flash_attention_2"
         super().__init__(config)
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -1504,12 +1413,8 @@ class NemotronHModel(NemotronHPreTrainedModel):
     def set_input_embeddings(self, new_embeddings):
         self.embeddings = new_embeddings
 
-    @add_start_docstrings_to_model_forward(NEMOTRONH_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=NemotronHOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
+    @can_return_tuple
+    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1519,19 +1424,15 @@ class NemotronHModel(NemotronHPreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> Union[Tuple, NemotronHOutput]:
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> NemotronHOutput:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        # use_cache = use_cache if use_cache is not None else self.config.use_cache
         use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.training else False)
-
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if (input_ids is None) ^ (inputs_embeds is not None):  # ^ is python for xor
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1559,7 +1460,7 @@ class NemotronHModel(NemotronHPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position)
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, cache_params, output_attentions)
         mamba_mask = self._update_mamba_mask(attention_mask, cache_position)
 
         all_hidden_states = () if output_hidden_states else None
@@ -1580,17 +1481,12 @@ class NemotronHModel(NemotronHPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                hidden_states = self._gradient_checkpointing_func(
-                    mixer_block.__call__, hidden_states, cache_params, cache_position, layer_mask
-                )
-            else:
-                hidden_states = mixer_block(
-                    hidden_states,
-                    cache_params=cache_params,
-                    cache_position=cache_position,
-                    attention_mask=layer_mask,
-                )
+            hidden_states = mixer_block(
+                hidden_states,
+                cache_params=cache_params,
+                cache_position=cache_position,
+                attention_mask=layer_mask,
+            )
 
             # TODO: Store attentions
             # if output_attentions:
@@ -1607,8 +1503,8 @@ class NemotronHModel(NemotronHPreTrainedModel):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
-        if not return_dict:
-            return tuple(v for v in [hidden_states, cache_params, all_hidden_states] if v is not None)
+        if cache_params and not cache_params.has_previous_state:
+            cache_params.has_previous_state = True
 
         return NemotronHOutput(
             last_hidden_state=hidden_states,
@@ -1617,39 +1513,97 @@ class NemotronHModel(NemotronHPreTrainedModel):
             attentions=all_self_attns,
         )
 
-    # Copied from transformers.models.jamba.modeling_jamba.JambaModel._update_causal_mask
-    def _update_causal_mask(self, attention_mask, input_tensor, cache_position):
+    def _update_causal_mask(
+        self,
+        attention_mask: torch.Tensor,
+        input_tensor: torch.Tensor,
+        cache_position: torch.Tensor,
+        cache_params: HybridMambaAttentionDynamicCache,
+        output_attentions: bool,
+    ):
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and 0.0 in attention_mask:
                 return attention_mask
             return None
 
-        dtype, device = input_tensor.dtype, input_tensor.device
-        min_dtype = torch.finfo(dtype).min
-        sequence_length = input_tensor.shape[1]
-        target_length = cache_position[-1] + 1
+        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
+        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
+        # to infer the attention mask.
+        past_seen_tokens = cache_params.get_seq_length() if cache_params is not None else 0
 
-        causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
-        if sequence_length != 1:
-            causal_mask = torch.triu(causal_mask, diagonal=1)
-        causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
-        causal_mask = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
-        if attention_mask is not None:
-            causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-            if attention_mask.dim() == 2:
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[..., :mask_length].eq(0.0) * attention_mask[:, None, None, :].eq(0.0)
-                causal_mask[..., :mask_length] = causal_mask[..., :mask_length].masked_fill(padding_mask, min_dtype)
+        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
+        if self.config._attn_implementation == "sdpa" and not output_attentions:
+            if AttentionMaskConverter._ignore_causal_mask_sdpa(
+                attention_mask,
+                inputs_embeds=input_tensor,
+                past_key_values_length=past_seen_tokens,
+                is_training=self.training,
+            ):
+                return None
+
+        dtype = input_tensor.dtype
+        sequence_length = input_tensor.shape[1]
+        target_length = (
+            attention_mask.shape[-1]
+            if isinstance(attention_mask, torch.Tensor)
+            else past_seen_tokens + sequence_length + 1
+        )
+
+        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+            attention_mask,
+            sequence_length=sequence_length,
+            target_length=target_length,
+            dtype=dtype,
+            cache_position=cache_position,
+            batch_size=input_tensor.shape[0],
+        )
 
         if (
             self.config._attn_implementation == "sdpa"
             and attention_mask is not None
-            and attention_mask.device.type == "cuda"
+            and attention_mask.device.type in ["cuda", "xpu", "npu"]
+            and not output_attentions
         ):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
             # Details: https://github.com/pytorch/pytorch/issues/110213
+            min_dtype = torch.finfo(dtype).min
             causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+
+        return causal_mask
+
+    @staticmethod
+    def _prepare_4d_causal_attention_mask_with_cache_position(
+        attention_mask: torch.Tensor,
+        sequence_length: int,
+        target_length: int,
+        dtype: torch.dtype,
+        cache_position: torch.Tensor,
+        batch_size: int,
+        **kwargs,
+    ):
+        if attention_mask is not None and attention_mask.dim() == 4:
+            causal_mask = attention_mask
+        else:
+            min_dtype = torch.finfo(dtype).min
+            causal_mask = torch.full(
+                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
+            )
+            if sequence_length != 1:
+                causal_mask = torch.triu(causal_mask, diagonal=1)
+            causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
+            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+            if attention_mask is not None:
+                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+                mask_length = attention_mask.shape[-1]
+                padding_attention_mask = (attention_mask[:, None, None, :] == attention_mask[:, None, :, None])[
+                    :, :, -sequence_length:, :
+                ].to(dtype)
+                padding_mask = causal_mask[:, :, :, :mask_length] + padding_attention_mask
+                padding_mask = padding_mask == 0
+                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                    padding_mask, min_dtype
+                )
 
         return causal_mask
 
@@ -1665,17 +1619,16 @@ class NemotronHModel(NemotronHPreTrainedModel):
         return mamba_mask
 
 
-@add_start_docstrings(
-    """
-    The NEMOTRONH Model transformer with a language modeling head on top (linear layer with weights not tied to the input
-    embeddings).
-    """,
-    NEMOTRONH_START_DOCSTRING,
-)
+@auto_docstring
 class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "backbone.embeddings.weight"}
 
     def __init__(self, config):
+        # Default to FA2 when the user has not explicitly set attn_implementation.
+        # Must be done before super().__init__() which runs _check_and_adjust_attn_implementation
+        # and overwrites _attn_implementation_internal with "eager" (SDPA is not supported here).
+        if config._attn_implementation_internal is None:
+            config._attn_implementation = "flash_attention_2"
         super().__init__(config)
         self.backbone = NemotronHModel(config)
         self.vocab_size = config.vocab_size
@@ -1697,10 +1650,10 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         self.lm_head = new_embeddings
 
     def get_decoder(self):
-        return self.model
+        return self.backbone
 
     def set_decoder(self, decoder):
-        self.model = decoder
+        self.backbone = decoder
 
     def prepare_inputs_for_generation(
         self,
@@ -1751,22 +1704,24 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         model_inputs.update(
             {
                 "position_ids": position_ids,
-                "past_key_values": past_key_values,
+                "cache_params": past_key_values,
                 "use_cache": use_cache,
                 "attention_mask": attention_mask,
                 "logits_to_keep": self.config.num_logits_to_keep,
                 "cache_position": cache_position,
             }
         )
+
+        # Forward ALL kwargs that are uninitialized (e.g. `use_cache`).
+        for key, value in kwargs.items():
+            if key not in model_inputs:
+                model_inputs[key] = value
+
         return model_inputs
 
     @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
-    @add_start_docstrings_to_model_forward(NEMOTRONH_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=NemotronHCausalLMOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
+    @can_return_tuple
+    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1776,13 +1731,12 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs,  # for now we need this for generation
-    ) -> Union[Tuple, NemotronHCausalLMOutput]:
+        **kwargs,
+    ) -> NemotronHCausalLMOutput:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
@@ -1790,44 +1744,29 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         nemotron_h_outputs = self.backbone(
             input_ids,
             cache_params=cache_params,
             inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
             use_cache=use_cache,
             cache_position=cache_position,
             attention_mask=attention_mask,
         )
-        hidden_states = nemotron_h_outputs[0]
+        hidden_states = nemotron_h_outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
-        # TODO: Check zamba_modeling.py: https://github.com/huggingface/transformers/blob/d7188ba600e36d3fd191b12e19f1b3bb81a8404f/src/transformers/models/zamba/modeling_zamba.py#L1284C1-L1286C2
-        #logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
         logits = self.lm_head(hidden_states[:, slice_indices, :].to(self.lm_head.weight.dtype)).float()
 
         loss = None
         if labels is not None:
-            # move labels to correct device to enable model parallelism
-            labels = labels.to(logits.device)
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-        if not return_dict:
-            output = (logits,) + nemotron_h_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
         return NemotronHCausalLMOutput(
             loss=loss,
