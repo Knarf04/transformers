@@ -501,23 +501,35 @@ class Mamba2Mixer(nn.Module):
                 )
 
                 if self.logits_reg:
+                    valid_mask = self.experiments.get("valid_mask", None)  # list[bool] or None
                     with torch.no_grad():
-                        state_dict = {}
-                        state_dict['x'] = hidden_states.view(batch_size, seq_len, -1, self.head_dim).cpu()
-                        state_dict['dt'] = dt.cpu()
-                        state_dict['A'] = A.cpu()
-                        state_dict['B'] = B.view(batch_size, seq_len, self.n_groups, -1).cpu()
-                        state_dict['C'] = C.view(batch_size, seq_len, self.n_groups, -1).cpu()
-                        state_dict['D'] = self.D.cpu()
-                        state_dict['dt_bias'] = self.dt_bias.cpu()
-
-                        logits_file = os.path.join(self.logits_dir, f'state_dict_sl={seq_len}_layer={self.layer_idx}_id={self.logits_num}.pt')
-                        torch.save(state_dict, logits_file)
-                        self.logits_num += 1
-                        if self.logits_num >= 5:
-                            self.logits_reg = False
+                        hs    = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
+                        B_mat = B.view(batch_size, seq_len, self.n_groups, -1)
+                        C_mat = C.view(batch_size, seq_len, self.n_groups, -1)
+                        for b in range(batch_size):
+                            if valid_mask is not None and not valid_mask[b]:
+                                continue
+                            state_dict = {
+                                'x':       hs[b:b+1].cpu(),
+                                'dt':      dt[b:b+1].cpu(),
+                                'A':       A.cpu(),
+                                'B':       B_mat[b:b+1].cpu(),
+                                'C':       C_mat[b:b+1].cpu(),
+                                'D':       self.D.cpu(),
+                                'dt_bias': self.dt_bias.cpu(),
+                            }
+                            logits_file = os.path.join(
+                                self.logits_dir,
+                                f'state_dict_sl={seq_len}_layer={self.layer_idx}_id={self.logits_num}.pt'
+                            )
+                            torch.save(state_dict, logits_file)
+                            self.logits_num += 1
+                            if self.logits_num >= 5:
+                                self.logits_reg = False
+                                break
 
                 if self.distribution_reg:
+                    valid_mask = self.experiments.get("valid_mask", None)
                     dtype = dt.dtype
                     dt_sp = nn.functional.softplus((dt + self.dt_bias).to(dtype=torch.float32)).to(dtype=dtype)
                     forget = torch.exp(A * dt_sp)
@@ -534,34 +546,51 @@ class Mamba2Mixer(nn.Module):
                         hidden_states[:, :seq_len_trunc].view(batch_size, seq_len_trunc, -1, self.head_dim),
                         interval=self.state_sample_interval, dt_bias=self.dt_bias,
                     )
-                    record = {
-                        "layer_idx": self.layer_idx,
-                        "dt_mean": dt_sp.mean(dim=1).tolist(),
-                        "dt_var": dt_sp.var(dim=1).tolist(),
-                        "forget_mean": forget_mean_seq.tolist(),
-                        "forget_var": forget.var(dim=1).tolist(),
-                        "spectrum_std": spectrum_std.tolist(),
-                        "erf": erf.tolist(),
-                        "state_cos_sim": state_cos_sim.tolist(),
-                    }
-                    filename = f"/gpfs/hshen/mmd/{self.disp_name}/layer{self.layer_idx}.jsonl"
-                    os.makedirs(os.path.dirname(filename), exist_ok=True)
-                    with open(filename, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(record) + '\n')
+
+                    if valid_mask is not None:
+                        valid_idx = torch.tensor([b for b, v in enumerate(valid_mask) if v],
+                                                 dtype=torch.long, device=dt.device)
+                    else:
+                        valid_idx = torch.arange(batch_size, device=dt.device)
+
+                    if len(valid_idx) > 0:
+                        record = {
+                            "layer_idx":     self.layer_idx,
+                            "dt_mean":       dt_sp.mean(dim=1)[valid_idx].tolist(),
+                            "dt_var":        dt_sp.var(dim=1)[valid_idx].tolist(),
+                            "forget_mean":   forget_mean_seq[valid_idx].tolist(),
+                            "forget_var":    forget.var(dim=1)[valid_idx].tolist(),
+                            "spectrum_std":  spectrum_std[valid_idx].tolist(),
+                            "erf":           erf[valid_idx].tolist(),
+                            "state_cos_sim": state_cos_sim[valid_idx].tolist(),
+                        }
+                        filename = f"/gpfs/hshen/mmd/{self.disp_name}/layer{self.layer_idx}.jsonl"
+                        os.makedirs(os.path.dirname(filename), exist_ok=True)
+                        with open(filename, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(record) + '\n')
 
                 if self.mmd:
+                    valid_mask = self.experiments.get("valid_mask", None)
                     B_view = B.view(batch_size, seq_len, self.n_groups, -1)
                     C_view = C.view(batch_size, seq_len, self.n_groups, -1)
-                    mmd = mmd_ssd_last_triton(dt, A, B_view, C_view, dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
-                    record = {
-                        "layer_idx": self.layer_idx,
-                        "seq_len": self.seq_len,
-                        "erf": mmd.tolist()
+                    mmd_val = mmd_ssd_last_triton(dt, A, B_view, C_view, dt_bias=self.dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")))
+
+                    if valid_mask is not None:
+                        valid_idx = torch.tensor([b for b, v in enumerate(valid_mask) if v],
+                                                 dtype=torch.long, device=dt.device)
+                    else:
+                        valid_idx = torch.arange(batch_size, device=dt.device)
+
+                    if len(valid_idx) > 0:
+                        record = {
+                            "layer_idx": self.layer_idx,
+                            "seq_len":   self.seq_len,
+                            "erf":       mmd_val[valid_idx].tolist(),
                         }
-                    filename = "/gpfs/hshen/mmd/mamba2.jsonl"
-                    os.makedirs(os.path.dirname(filename), exist_ok=True)
-                    with open(filename, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(record) + '\n')
+                        filename = "/gpfs/hshen/mmd/mamba2.jsonl"
+                        os.makedirs(os.path.dirname(filename), exist_ok=True)
+                        with open(filename, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(record) + '\n')
 
                 hidden_states = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
                 dt_bias = self.dt_bias
