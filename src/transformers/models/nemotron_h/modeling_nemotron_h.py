@@ -1229,11 +1229,14 @@ class NemotronHAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.head_dim * self.num_heads, self.hidden_size, bias=config.attention_bias)
 
-        self.experiments = getattr(config, "experiments", {}) 
-        
+        self.experiments = getattr(config, "experiments", {})
+
         self.logits_reg = self.experiments.get("logits_reg", False)
         self.logits_dir = self.experiments.get("logits_dir", "")
         self.logits_num = 0
+
+        self.temp_scale = self.experiments.get("temp_scale", False)
+        self.temp_scale_train_len = 8192
 
     def forward(
         self,
@@ -1284,6 +1287,15 @@ class NemotronHAttention(nn.Module):
                     if self.logits_num >= 5:
                         self.logits_reg = False
                         break
+
+        if self.temp_scale:
+            if cache_position is not None:
+                positions = cache_position.float() + 1
+            else:
+                positions = torch.arange(1, q_len + 1, device=query_states.device, dtype=torch.float32)
+            log_scales = torch.log(positions)
+            scale_factors = torch.clamp(log_scales / math.log(self.temp_scale_train_len), min=1.0)
+            query_states = query_states * scale_factors[None, None, :, None]
 
         attn_output, attn_weights = attention_interface(
             self,
