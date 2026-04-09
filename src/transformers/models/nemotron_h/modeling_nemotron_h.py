@@ -1295,7 +1295,7 @@ class NemotronHAttention(nn.Module):
                 positions = torch.arange(1, q_len + 1, device=query_states.device, dtype=torch.float32)
             log_scales = torch.log(positions)
             scale_factors = torch.clamp(log_scales / math.log(self.temp_scale_train_len), min=1.0)
-            query_states = query_states * scale_factors[None, None, :, None]
+            query_states = query_states * scale_factors.to(dtype=query_states.dtype)[None, None, :, None]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -1473,6 +1473,16 @@ class NemotronHModel(NemotronHPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> NemotronHOutput:
+        r"""
+        cache_params (`HybridMambaAttentionDynamicCache`, *optional*):
+            If passed along, the model uses the previous state in all the blocks (which will give the output for the
+            `input_ids` provided as if the model add `state_input_ids + input_ids` as context).
+        use_cache (`bool`, *optional*):
+            If set to `True`, the `cache_params` is returned and can be used to quickly generate the next logits.
+        cache_position (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            The position of the current input in the cache. This is used to ensure that the cache is correctly updated.
+            If `cache_params` is passed, `cache_position` should also be passed.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
