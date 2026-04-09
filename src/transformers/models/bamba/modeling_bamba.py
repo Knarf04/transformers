@@ -62,6 +62,9 @@ else:
 
 logger = logging.get_logger(__name__)
 
+# Max sequence length per mamba_chunk_scan_combined call to avoid int32
+# overflow in Triton kernel pointer arithmetic (breaks at seqlen > 131072).
+_MAMBA_PREFILL_CHUNK_SIZE = 65536
 
 import os
 
@@ -995,21 +998,50 @@ class BambaMixer(nn.Module):
                         dt = dt * token_sig
 
                 # 3. SSM transformation
-                scan_output, ssm_state = mamba_chunk_scan_combined(
-                    hidden_states,
-                    dt,
-                    A,
-                    B.view(batch_size, seq_len, self.n_groups, -1),
-                    C.view(batch_size, seq_len, self.n_groups, -1),
-                    chunk_size=self.chunk_size,
-                    D=self.D,
-                    z=None,
-                    seq_idx=seq_idx,
-                    return_final_states=True,
-                    dt_bias=dt_bias,
-                    dt_softplus=dt_softplus,
-                    **dt_limit_kwargs,
-                )
+                B_viewed = B.view(batch_size, seq_len, self.n_groups, -1)
+                C_viewed = C.view(batch_size, seq_len, self.n_groups, -1)
+
+                if seq_len <= _MAMBA_PREFILL_CHUNK_SIZE:
+                    scan_output, ssm_state = mamba_chunk_scan_combined(
+                        hidden_states,
+                        dt,
+                        A,
+                        B_viewed,
+                        C_viewed,
+                        chunk_size=self.chunk_size,
+                        D=self.D,
+                        z=None,
+                        seq_idx=seq_idx,
+                        return_final_states=True,
+                        dt_bias=dt_bias,
+                        dt_softplus=dt_softplus,
+                        **dt_limit_kwargs,
+                    )
+                else:
+                    # Chunked prefill: split into segments to avoid int32
+                    # overflow in Triton kernel pointer arithmetic.
+                    scan_outputs = []
+                    ssm_state = None
+                    for start in range(0, seq_len, _MAMBA_PREFILL_CHUNK_SIZE):
+                        end = min(start + _MAMBA_PREFILL_CHUNK_SIZE, seq_len)
+                        chunk_out, ssm_state = mamba_chunk_scan_combined(
+                            hidden_states[:, start:end],
+                            dt[:, start:end],
+                            A,
+                            B_viewed[:, start:end],
+                            C_viewed[:, start:end],
+                            chunk_size=self.chunk_size,
+                            D=self.D,
+                            z=None,
+                            seq_idx=seq_idx[:, start:end] if seq_idx is not None else None,
+                            initial_states=ssm_state,
+                            return_final_states=True,
+                            dt_bias=dt_bias,
+                            dt_softplus=dt_softplus,
+                            **dt_limit_kwargs,
+                        )
+                        scan_outputs.append(chunk_out)
+                    scan_output = torch.cat(scan_outputs, dim=1)
 
                 # Init cache
                 if ssm_state is not None and cache_params is not None:
