@@ -1238,6 +1238,10 @@ class NemotronHAttention(nn.Module):
         self.temp_scale = self.experiments.get("temp_scale", False)
         self.temp_scale_train_len = 8192
 
+        self.save_attn_map = self.experiments.get("save_attn_map", False)
+        self.attn_chunk_size = self.experiments.get("attn_chunk_size", 8192)
+        self.attn_map_num = 0
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1296,6 +1300,62 @@ class NemotronHAttention(nn.Module):
             log_scales = torch.log(positions)
             scale_factors = torch.clamp(log_scales / math.log(self.temp_scale_train_len), min=1.0)
             query_states = query_states * scale_factors.to(dtype=query_states.dtype)[None, None, :, None]
+
+        if self.save_attn_map and q_len > 1:
+            valid_mask = self.experiments.get("valid_mask", None)
+            with torch.no_grad():
+                k_full = repeat_kv(key_states, self.num_key_value_groups)
+                kv_len = k_full.shape[-2]
+                q_offset = kv_len - q_len
+                chunk = int(self.attn_chunk_size)
+
+                save_dtype = torch.bfloat16
+
+                if attention_mask is None:
+                    q_pos = torch.arange(q_offset, q_offset + q_len, device=query_states.device)
+                    k_pos = torch.arange(kv_len, device=query_states.device)
+                    add_mask_full = torch.zeros((q_len, kv_len), dtype=query_states.dtype, device=query_states.device)
+                    add_mask_full.masked_fill_(k_pos[None, :] > q_pos[:, None], torch.finfo(query_states.dtype).min)
+                else:
+                    add_mask_full = None
+
+                for b in range(bsz):
+                    if valid_mask is not None and not valid_mask[b]:
+                        continue
+
+                    if add_mask_full is not None:
+                        causal_mask_b = add_mask_full[None, None, :, :]
+                    else:
+                        causal_mask_b = attention_mask[b:b+1, :, :, :kv_len]
+
+                    for h in range(self.num_heads):
+                        q_h = query_states[b:b+1, h:h+1, :, :]
+                        k_h = k_full[b:b+1, h:h+1, :, :]
+                        k_h_t = k_h.transpose(-1, -2)
+
+                        head_map = torch.empty((q_len, kv_len), dtype=save_dtype, device='cpu', pin_memory=False)
+
+                        for start in range(0, q_len, chunk):
+                            end = min(start + chunk, q_len)
+                            q_chunk = q_h[:, :, start:end, :]
+                            scores = torch.matmul(q_chunk, k_h_t) * self.scaling
+                            scores = scores + causal_mask_b[:, :, start:end, :]
+                            attn = nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(save_dtype)
+                            head_map[start:end].copy_(attn.squeeze(0).squeeze(0), non_blocking=False)
+                            del scores, attn, q_chunk
+
+                        attn_file = os.path.join(
+                            self.logits_dir,
+                            f'attn_map_sl={q_len}_layer={self.layer_idx}_head={h}_id={self.attn_map_num}.pt'
+                        )
+                        os.makedirs(self.logits_dir, exist_ok=True)
+                        torch.save({'attn_map': head_map}, attn_file)
+                        del head_map
+
+                    self.attn_map_num += 1
+                    if self.attn_map_num >= 5:
+                        self.save_attn_map = False
+                        break
 
         attn_output, attn_weights = attention_interface(
             self,
