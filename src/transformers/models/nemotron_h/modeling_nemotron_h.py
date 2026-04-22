@@ -1241,6 +1241,7 @@ class NemotronHAttention(nn.Module):
         self.save_attn_map = self.experiments.get("save_attn_map", False)
         self.attn_chunk_size = self.experiments.get("attn_chunk_size", 8192)
         self.attn_map_num = 0
+        self.disp_name = self.experiments.get("disp_name", "nemotronh")
 
     def forward(
         self,
@@ -1344,12 +1345,9 @@ class NemotronHAttention(nn.Module):
                             head_map[start:end].copy_(attn.squeeze(0).squeeze(0), non_blocking=False)
                             del scores, attn, q_chunk
 
-                        attn_file = os.path.join(
-                            self.logits_dir,
-                            f'attn_map_sl={q_len}_layer={self.layer_idx}_head={h}_id={self.attn_map_num}.pt'
-                        )
-                        os.makedirs(self.logits_dir, exist_ok=True)
-                        torch.save({'attn_map': head_map}, attn_file)
+                        filename = f"/gpfs/hshen/hybrid_attn_map/{self.disp_name}/layer{self.layer_idx}_head{h}_id{self.attn_map_num}.pt"
+                        os.makedirs(os.path.dirname(filename), exist_ok=True)
+                        torch.save({'attn_map': head_map, 'seq_len': q_len}, filename)
                         del head_map
 
                     self.attn_map_num += 1
