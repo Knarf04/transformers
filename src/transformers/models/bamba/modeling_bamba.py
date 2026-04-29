@@ -668,6 +668,7 @@ class BambaMixer(nn.Module):
         self.disp_name = self.experiments.get("disp_name", "bamba2")
 
         self.state_sample_interval = self.experiments.get("state_sample_interval", 2048)
+        self.state_bin_size = self.experiments.get("state_bin_size", 1024)
 
         if not is_fast_path_available:
             logger.warning_once(
@@ -928,6 +929,40 @@ class BambaMixer(nn.Module):
                                         interval=self.state_sample_interval, dt_bias=self.dt_bias,
                                     )
 
+                    bin_size = self.state_bin_size
+                    if seq_len < bin_size:
+                        bin_boundaries = [seq_len]
+                    else:
+                        n_full = seq_len // bin_size
+                        bin_boundaries = [(i + 1) * bin_size for i in range(n_full)]
+
+                    x_view = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
+                    state_mag_bins = []
+                    with torch.no_grad():
+                        init_state = None
+                        prev = 0
+                        for end in bin_boundaries:
+                            _, init_state = mamba_chunk_scan_combined(
+                                x_view[:, prev:end],
+                                dt[:, prev:end],
+                                A,
+                                B_reshaped[:, prev:end],
+                                C_reshaped[:, prev:end],
+                                chunk_size=self.chunk_size,
+                                D=self.D,
+                                z=None,
+                                seq_idx=None,
+                                initial_states=init_state,
+                                return_final_states=True,
+                                dt_bias=self.dt_bias,
+                                dt_softplus=True,
+                                **dt_limit_kwargs,
+                            )
+                            bin_norm = torch.linalg.vector_norm(init_state.float(), dim=(-2, -1))
+                            state_mag_bins.append(bin_norm)
+                            prev = end
+                    state_mag_bin = torch.stack(state_mag_bins, dim=-1)
+
                     # Build index of samples to record; fall back to all when no mask is set
                     if valid_mask is not None:
                         valid_idx = torch.tensor([b for b, v in enumerate(valid_mask) if v],
@@ -937,14 +972,17 @@ class BambaMixer(nn.Module):
 
                     if len(valid_idx) > 0:
                         record = {
-                            "layer_idx":     self.layer_idx,
-                            "dt_mean":       dt_sp.mean(dim=1)[valid_idx].tolist(),
-                            "dt_var":        dt_sp.var(dim=1)[valid_idx].tolist(),
-                            "forget_mean":   forget_mean_seq[valid_idx].tolist(),
-                            "forget_var":    forget.var(dim=1)[valid_idx].tolist(),
-                            "spectrum_std":  spectrum_std[valid_idx].tolist(),
-                            "erf":           erf[valid_idx].tolist(),
-                            "state_cos_sim": state_cos_sim[valid_idx].tolist(),
+                            "layer_idx":      self.layer_idx,
+                            "dt_mean":        dt_sp.mean(dim=1)[valid_idx].tolist(),
+                            "dt_var":         dt_sp.var(dim=1)[valid_idx].tolist(),
+                            "forget_mean":    forget_mean_seq[valid_idx].tolist(),
+                            "forget_var":     forget.var(dim=1)[valid_idx].tolist(),
+                            "spectrum_std":   spectrum_std[valid_idx].tolist(),
+                            "erf":            erf[valid_idx].tolist(),
+                            "state_cos_sim":  state_cos_sim[valid_idx].tolist(),
+                            "state_mag_bin":  state_mag_bin[valid_idx].tolist(),
+                            "state_bin_size": int(bin_size),
+                            "seq_len":        int(seq_len),
                         }
                         filename = f"/gpfs/hshen/mmd/{self.disp_name}/layer{self.layer_idx}.jsonl"
                         os.makedirs(os.path.dirname(filename), exist_ok=True)
