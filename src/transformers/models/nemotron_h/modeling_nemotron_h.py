@@ -612,8 +612,22 @@ class NemotronHMamba2Mixer(nn.Module):
                         n_full = seq_len // bin_size
                         bin_boundaries = [(i + 1) * bin_size for i in range(n_full)]
 
+                    # Cumulative log-decay through the last token of each bin: A * dt_sp summed
+                    # along the sequence axis, then sampled at boundary positions. Matches
+                    # `positions = arange(n_bins) * bin_size + (bin_size - 1)` in summarize.py.
+                    # Done in fp32: dt_sp is in the model dtype (e.g. bf16) and a long-sequence
+                    # cumsum followed by exp() loses precision badly otherwise.
+                    step_log_decay = A.float()[None, None, :] * dt_sp.float()                    # [B, L, H, fp32]
+                    step_log_decay_cum = step_log_decay.cumsum(dim=1)                            # [B, L, H, fp32]
+                    boundary_idx = torch.tensor([end - 1 for end in bin_boundaries],
+                                                device=dt_sp.device, dtype=torch.long)
+                    log_decay_cumulative = step_log_decay_cum.index_select(
+                        dim=1, index=boundary_idx
+                    ).permute(0, 2, 1).contiguous()                                              # [B, H, n_bins]
+
                     x_view = hidden_states.view(batch_size, seq_len, -1, self.head_dim)
                     state_mag_bins = []
+                    state_at_bin = []  # diagnostic-only; loss-side construction lives elsewhere
                     with torch.no_grad():
                         init_state = None
                         prev = 0
@@ -636,8 +650,16 @@ class NemotronHMamba2Mixer(nn.Module):
                             )
                             bin_norm = torch.linalg.vector_norm(init_state.float(), dim=(-2, -1))
                             state_mag_bins.append(bin_norm)
+                            state_at_bin.append(init_state.float())
                             prev = end
-                    state_mag_bin = torch.stack(state_mag_bins, dim=-1)
+                    state_mag_bin = torch.stack(state_mag_bins, dim=-1)                          # [B, H, n_bins]
+
+                    # <h_T, h_t>_F per (batch, head, bin). Frobenius inner product so that the
+                    # geometric-extension construction ||α_t·S_k·h_T + h_t|| is exact downstream.
+                    states_stacked = torch.stack(state_at_bin, dim=-1)                           # [B, H, P, N, n_bins]
+                    h_T = states_stacked[..., -1:]                                               # [B, H, P, N, 1]
+                    state_inner_product = (states_stacked * h_T).sum(dim=(2, 3))                 # [B, H, n_bins]
+                    del states_stacked, h_T, state_at_bin
 
                     if valid_mask is not None:
                         valid_idx = torch.tensor([b for b, v in enumerate(valid_mask) if v],
@@ -656,6 +678,8 @@ class NemotronHMamba2Mixer(nn.Module):
                             "erf":            erf[valid_idx].tolist(),
                             "state_cos_sim":  state_cos_sim[valid_idx].tolist(),
                             "state_mag_bin":  state_mag_bin[valid_idx].tolist(),
+                            "log_decay_cumulative": log_decay_cumulative[valid_idx].cpu().tolist(),
+                            "state_inner_product":  state_inner_product[valid_idx].cpu().tolist(),
                             "state_bin_size": int(bin_size),
                             "seq_len":        int(seq_len),
                         }
